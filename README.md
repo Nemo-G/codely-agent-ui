@@ -1,4 +1,10 @@
 # Unity Agent Client
+
+[![GitHub license](https://img.shields.io/github/license/nuskey8/UnityAgentClient)](./LICENSE)
+![Unity 2021.3+](https://img.shields.io/badge/unity-2021.3+-000.svg)
+
+English | [日本語](README_JA.md)
+
 Provides integration of any AI agent (Gemini CLI, Claude Code, Codex CLI, etc.) with the Unity editor using Agent Client Protocol(ACP).
 
 ![demo](/docs/images/img-demo.gif)
