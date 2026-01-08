@@ -339,9 +339,13 @@ namespace Codely.UnityAgentClientUI
                 UnityEngine.Debug.Log($"[IPC Sync] RequestShow: now={now:0.000} forceShowFor={forceShowUntil - now:0.000}s ipc={ipcPath}");
             }
 
-            // Clear potentially-poisoned rect cache (e.g. bogus huge negative coords during move/resize).
-            hasLastGoodRect = false;
+            // Keep lastGoodRect across focus changes: during fast tab switches / docking Unity can fail to report a
+            // valid rect for a frame. If we clear the cache here, we'd be forced to "invent" a rect (flash).
             wroteRectOnce = false;
+            if (hasLastGoodRect && !IsRectSanePx(lastGoodX, lastGoodY, lastGoodW, lastGoodH))
+            {
+                hasLastGoodRect = false;
+            }
 
             try
             {
@@ -361,21 +365,21 @@ namespace Codely.UnityAgentClientUI
 
                 if (rectOk && TryComputeSaneRectPx(embedRectScreenPoints, out var xPx, out var yPx, out var wPx, out var hPx, out _))
                 {
+                    hasLastGoodRect = true;
+                    lastGoodX = xPx; lastGoodY = yPx; lastGoodW = wPx; lastGoodH = hPx;
                     syncIpc?.WriteRect(xPx, yPx, wPx, hPx, visible: true, active: true, ownerHwnd: ownerHwnd);
+                    wroteRectOnce = true;
+                }
+                else if (hasLastGoodRect && IsRectSanePx(lastGoodX, lastGoodY, lastGoodW, lastGoodH))
+                {
+                    // No fresh rect yet; show at the last known good position (never invent a new one).
+                    syncIpc?.WriteRect(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: true, ownerHwnd: ownerHwnd);
+                    wroteRectOnce = true;
                 }
                 else
                 {
-                    // Last-resort: recenter to virtual screen so the user can recover even if the current rect is missing/garbage.
-                    if (TryGetFallbackRectPx(out var fx, out var fy, out var fw, out var fh))
-                    {
-                        hasLastGoodRect = true;
-                        lastGoodX = fx; lastGoodY = fy; lastGoodW = fw; lastGoodH = fh;
-                        syncIpc?.WriteRect(fx, fy, fw, fh, visible: true, active: true, ownerHwnd: ownerHwnd);
-                    }
-                    else
-                    {
-                        syncIpc?.WriteFlags(visible: true, active: true);
-                    }
+                    // Don't invent a rect. If we have none yet, keep the window hidden until OnGUI publishes a real one.
+                    syncIpc?.WriteFlags(visible: true, active: true);
                 }
             }
             catch
@@ -683,30 +687,14 @@ namespace Codely.UnityAgentClientUI
 
                 if (!rectOk && !hasLastGoodRect)
                 {
-                    // We have no valid rect yet. Publish a fallback on-screen rect so Tauri can actually show (no-flash mode requires w/h>0).
-                    if (TryGetFallbackRectPx(out var fx, out var fy, out var fw, out var fh))
-                    {
-                        hasLastGoodRect = true;
-                        lastGoodX = fx; lastGoodY = fy; lastGoodW = fw; lastGoodH = fh;
-                        syncIpc.WriteRect(fx, fy, fw, fh, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
-                        wroteRectOnce = true;
-                        lastError = null;
-
-                        if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
-                        {
-                            nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
-                            UnityEngine.Debug.Log($"[IPC Sync] rect not ready; fallback recenter: seq={syncIpc.LastSeq} rect=({fx},{fy},{fw},{fh}) visible=1 active={(activeWanted ? 1 : 0)} owner=0x{ownerHwnd:X} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} ipc={ipcPath}");
-                        }
-                        return;
-                    }
-
-                    // No fallback available; keep visible state, but don't move.
+                    // Rect isn't ready yet (common during fast tab switches). Do NOT invent a fallback position.
+                    // Keep the last mapping rect (if any) and only update visibility/topmost flags.
                     try { syncIpc?.WriteFlags(visible: true, active: activeWanted); } catch { }
                     wroteRectOnce = false;
                     if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
                     {
                         nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
-                        UnityEngine.Debug.Log($"[IPC Sync] rect not ready yet: visible=1 active={(activeWanted ? 1 : 0)} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} rect=({embedRectScreenPoints.xMin:0.##},{embedRectScreenPoints.yMin:0.##},{embedRectScreenPoints.width:0.##},{embedRectScreenPoints.height:0.##}) ppp={EditorGUIUtility.pixelsPerPoint:0.##} ipc={ipcPath} seq={(syncIpc != null ? syncIpc.LastSeq : 0)}");
+                        UnityEngine.Debug.Log($"[IPC Sync] rect not ready yet (no fallback): visible=1 active={(activeWanted ? 1 : 0)} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} rect=({embedRectScreenPoints.xMin:0.##},{embedRectScreenPoints.yMin:0.##},{embedRectScreenPoints.width:0.##},{embedRectScreenPoints.height:0.##}) ppp={EditorGUIUtility.pixelsPerPoint:0.##} ipc={ipcPath} seq={(syncIpc != null ? syncIpc.LastSeq : 0)}");
                     }
                     return;
                 }
@@ -733,25 +721,7 @@ namespace Codely.UnityAgentClientUI
                         return;
                     }
 
-                    // No sane rect to publish yet.
-                    // If we don't have ANY known-good rect, publish a fallback on-screen rect so the user can recover.
-                    if (!hasLastGoodRect && TryGetFallbackRectPx(out var fx, out var fy, out var fw, out var fh))
-                    {
-                        hasLastGoodRect = true;
-                        lastGoodX = fx; lastGoodY = fy; lastGoodW = fw; lastGoodH = fh;
-                        syncIpc.WriteRect(fx, fy, fw, fh, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
-                        wroteRectOnce = true;
-                        lastError = null;
-
-                        if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
-                        {
-                            nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
-                            UnityEngine.Debug.Log($"[IPC Sync] rect insane; fallback recenter: seq={syncIpc.LastSeq} rect=({fx},{fy},{fw},{fh}) visible=1 active={(activeWanted ? 1 : 0)} owner=0x{ownerHwnd:X} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} ipc={ipcPath}");
-                        }
-                        return;
-                    }
-
-                    // Otherwise: keep visible state, but don't move (avoid moving off-screen).
+                    // No sane rect to publish yet; do not invent one. Keep visible state, but don't move.
                     try { syncIpc?.WriteFlags(visible: true, active: activeWanted); } catch { }
                     wroteRectOnce = false;
                     if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
