@@ -19,10 +19,12 @@ namespace Codely.UnityAgentClientUI
         // 20 i32 w
         // 24 i32 h
         // 28 i32 reserved (toolbar px for future / padding)
-        // 32 u32 flags (bit0: visible)
+        // 32 u32 flags (bit0: visible, bit1: active)
         const int SizeBytes = 64;
         const uint Magic = 0x31495543; // "CUI1" little-endian
         const uint Version = 1;
+        const uint FlagVisible = 1u << 0;
+        const uint FlagActive = 1u << 1;
 
         readonly string path;
         readonly FileStream file;
@@ -90,7 +92,7 @@ namespace Codely.UnityAgentClientUI
         public string MappingPath => path;
         public uint LastSeq => seq;
 
-        public void WriteRect(int x, int y, int w, int h, bool visible, long ownerHwnd = 0)
+        public void WriteRect(int x, int y, int w, int h, bool visible, bool active, long ownerHwnd = 0)
         {
             // NOTE: Keep this as cheap as possible; called every editor tick.
             // Two-phase commit: write data first, then update seq last so readers can detect torn writes.
@@ -100,7 +102,8 @@ namespace Codely.UnityAgentClientUI
                 accessor.Write(16, y);
                 accessor.Write(20, w);
                 accessor.Write(24, h);
-                accessor.Write(32, visible ? 1u : 0u);
+                var flags = (visible ? FlagVisible : 0u) | (active ? FlagActive : 0u);
+                accessor.Write(32, flags);
                 accessor.Write(40, ownerHwnd);
 
                 seq++;
@@ -114,11 +117,12 @@ namespace Codely.UnityAgentClientUI
             }
         }
 
-        public void WriteVisible(bool visible)
+        public void WriteFlags(bool visible, bool active)
         {
             try
             {
-                accessor.Write(32, visible ? 1u : 0u);
+                var flags = (visible ? FlagVisible : 0u) | (active ? FlagActive : 0u);
+                accessor.Write(32, flags);
                 seq++;
                 accessor.Write(8, seq);
             }

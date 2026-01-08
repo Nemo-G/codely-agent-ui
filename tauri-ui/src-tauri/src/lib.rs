@@ -75,8 +75,9 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
         return;
     };
     ipc_log(&format!("[tauri][ipc] mode=sync path={}", path));
-
-    let _ = window.set_focus(); // best-effort: keep input working when it appears
+    // IMPORTANT:
+    // - Do NOT steal focus on startup (Unity should remain foreground).
+    // - We'll show the window only after we have a valid rect from IPC, positioned first.
 
     std::thread::spawn(move || {
         let file = match OpenOptions::new().read(true).open(&path) {
@@ -98,9 +99,10 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
         };
 
         let mut last_seq: u32 = 0;
-        let mut last_visible: u32 = 0;
         let mut last_owner: i64 = 0;
         let mut tick: u32 = 0;
+        let mut is_shown: bool = false;
+        let mut last_active: u32 = 0;
 
         #[cfg(windows)]
         let hwnd: isize = match window.hwnd() {
@@ -147,10 +149,11 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
             last_seq = seq1;
 
             let visible = flags & 1;
+            let active = flags & 2;
             if tick % 60 == 0 {
                 ipc_log(&format!(
-                    "[tauri][ipc] seq={} rect=({},{} {}x{}) visible={} owner={}",
-                    seq1, x, y, w, h, visible, owner
+                    "[tauri][ipc] seq={} rect=({},{} {}x{}) visible={} active={} owner={}",
+                    seq1, x, y, w, h, visible, active, owner
                 ));
             }
 
@@ -158,12 +161,14 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
             {
                 if hwnd != 0 {
                     use windows_sys::Win32::UI::WindowsAndMessaging::{
-                        SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_HWNDPARENT, SWP_NOACTIVATE,
-                        SW_HIDE, SW_SHOW,
+                        SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_HWNDPARENT, SWP_NOACTIVATE, SWP_NOZORDER,
+                        SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
                     };
+                    const HWND_TOP: isize = 0;
                     const HWND_TOPMOST: isize = -1;
+                    const HWND_NOTOPMOST: isize = -2;
 
-                    if owner != 0 && owner != last_owner {
+                    if owner != last_owner {
                         last_owner = owner;
                         unsafe {
                             let _ = SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, owner as isize);
@@ -171,20 +176,46 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
                         ipc_log(&format!("[tauri][ipc] set owner={}", owner));
                     }
 
-                    if visible != last_visible {
-                        last_visible = visible;
+                    // Only show once we have a valid rect. This prevents the "flash at (0,0) then move" on startup.
+                    let want_show = visible != 0 && w > 0 && h > 0;
+                    let want_topmost = active != 0;
+                    if want_show && !is_shown {
                         unsafe {
-                            ShowWindow(hwnd, if visible != 0 { SW_SHOW } else { SW_HIDE });
+                            // Position first (still hidden), then show without activating Unity focus.
+                            let insert_after = if want_topmost { HWND_TOPMOST } else { HWND_TOP };
+                            let flags = if want_topmost { SWP_NOACTIVATE } else { SWP_NOACTIVATE | SWP_NOZORDER };
+                            SetWindowPos(hwnd, insert_after, x, y, w, h, flags);
+                            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                         }
-                        ipc_log(&format!("[tauri][ipc] show={}", visible));
+                        is_shown = true;
+                        ipc_log("[tauri][ipc] show=1 (no-activate)");
+                    } else if !want_show && is_shown {
+                        unsafe {
+                            // Ensure we don't remain topmost when hidden.
+                            if last_active != 0 {
+                                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                            }
+                            ShowWindow(hwnd, SW_HIDE);
+                        }
+                        is_shown = false;
+                        ipc_log("[tauri][ipc] show=0");
                     }
 
-                    if visible != 0 && w > 0 && h > 0 {
+                    if want_show {
                         unsafe {
-                            // Aggressive: keep the window top-most so it never disappears behind other editor windows.
-                            // This is intentionally stronger than owner-only z-order.
-                            SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+                            if want_topmost {
+                                // User requested: when active, keep it at the very top (but we hide when Unity isn't active).
+                                SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
+                            } else {
+                                // When not active, DO NOT fight z-order; only move/size.
+                                // This avoids "always on top" within Unity when other editor windows are focused.
+                                if last_active != 0 {
+                                    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                                }
+                                SetWindowPos(hwnd, HWND_TOP, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+                            }
                         }
+                        last_active = active;
                         if tick % 60 == 0 {
                             ipc_log("[tauri][ipc] SetWindowPos");
                         }
@@ -195,16 +226,16 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
             }
 
             // Fallback: use Tauri cross-platform window APIs.
-            if visible != last_visible {
-                last_visible = visible;
-                if visible != 0 {
-                    let _ = window.show();
-                } else {
-                    let _ = window.hide();
-                }
+            let want_show = visible != 0 && w > 0 && h > 0;
+            if want_show && !is_shown {
+                let _ = window.show();
+                is_shown = true;
+            } else if !want_show && is_shown {
+                let _ = window.hide();
+                is_shown = false;
             }
 
-            if visible != 0 && w > 0 && h > 0 {
+            if want_show {
                 let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
                 let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
                     width: w as u32,
@@ -219,18 +250,27 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
 pub fn run() {
     let url_str = env::var("UNITY_AGENT_CLIENT_UI_URL").unwrap_or_else(|_| "http://localhost:3999".to_string());
     let url = url_str.parse().unwrap();
+    let is_sync = env::var("UNITY_AGENT_CLIENT_UI_IPC_MODE")
+        .map(|v| v.to_lowercase() == "sync")
+        .unwrap_or(false);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             // Create a single main window that loads the external web UI.
-            let w = WebviewWindowBuilder::new(app, "main".to_string(), WebviewUrl::External(url))
+            let mut b = WebviewWindowBuilder::new(app, "main".to_string(), WebviewUrl::External(url))
                 .title("Unity Agent Client")
                 .inner_size(800.0, 600.0)
                 .decorations(false)
                 .resizable(true)
-                .skip_taskbar(true)
-                .build()?;
+                .skip_taskbar(true);
+
+            // IPC Sync: start hidden to avoid "flash then move". We'll show once IPC publishes a valid rect.
+            if is_sync {
+                b = b.visible(false).focused(false);
+            }
+
+            let w = b.build()?;
 
             maybe_start_ipc_sync(w.clone());
             Ok(())

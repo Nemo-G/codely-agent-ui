@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Text;
 using UnityEditor;
 using UnityEngine;
@@ -31,6 +32,7 @@ namespace Codely.UnityAgentClientUI
         const string SessionKey_ServerPid = "Codely.UnityAgentClientUI.IpcSync.ServerPid";
         const string SessionKey_UiPid = "Codely.UnityAgentClientUI.IpcSync.UiPid";
         const string SessionKey_IpcPath = "Codely.UnityAgentClientUI.IpcSync.IpcPath";
+        const string SessionKey_UserHidden = "Codely.UnityAgentClientUI.IpcSync.UserHidden";
 
         const float ToolbarHeight = 22f;
 
@@ -49,7 +51,23 @@ namespace Codely.UnityAgentClientUI
         bool hasLastGoodRect;
         int lastGoodX, lastGoodY, lastGoodW, lastGoodH;
         long lastOwnerHwnd;
-        double inactiveSince;
+
+        bool userHidden;
+        double forceShowUntil;
+        double lastFocusedAt;
+        double lastUnityAppActiveAt;
+        bool lastDesiredVisible;
+        bool lastDesiredActive;
+
+        // Focus-driven auto hide/show (requested):
+        // - When this window loses focus to another Unity editor window/tab -> hide.
+        // - When this window regains focus -> show once.
+        // IMPORTANT: Do not hide if the user clicked into the tauri-ui window itself.
+        bool pendingAutoHide;
+        double pendingAutoHideAt;
+
+        static bool s_checkedUnityAppActive;
+        static PropertyInfo s_unityIsAppActiveProp;
 
 #if UNITY_EDITOR_WIN
         [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -57,6 +75,14 @@ namespace Codely.UnityAgentClientUI
 
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        static extern int GetSystemMetrics(int nIndex);
+
+        const int SM_XVIRTUALSCREEN = 76;
+        const int SM_YVIRTUALSCREEN = 77;
+        const int SM_CXVIRTUALSCREEN = 78;
+        const int SM_CYVIRTUALSCREEN = 79;
 
         static int GetForegroundPid()
         {
@@ -70,11 +96,36 @@ namespace Codely.UnityAgentClientUI
         [MenuItem("Tools/Unity ACP Client (IPC Sync)")]
         static void OpenMenu() => OpenWindow();
 
+        [MenuItem("Tools/Unity ACP Client (IPC Sync) - Show")]
+        static void ShowMenu()
+        {
+            var w = OpenWindow();
+            w.RequestShow();
+        }
+
+        [MenuItem("Tools/Unity ACP Client (IPC Sync) - Hide")]
+        static void HideMenu()
+        {
+            var w = OpenWindow();
+            w.userHidden = true;
+            try { SessionState.SetBool(SessionKey_UserHidden, w.userHidden); } catch { }
+            try { w.syncIpc?.WriteFlags(visible: false, active: false); } catch { }
+            w.Repaint();
+        }
+
+        [MenuItem("Tools/Unity ACP Client (IPC Sync) - Debug - Dump State")]
+        static void DumpStateMenu()
+        {
+            var w = OpenWindow();
+            w.DumpState();
+        }
+
         static CodelyWebUiIpcSyncWindow OpenWindow()
         {
             var w = GetWindow<CodelyWebUiIpcSyncWindow>();
             w.titleContent = new GUIContent("AI Agent (IPC)");
             w.Show();
+            w.Focus();
             return w;
         }
 
@@ -85,6 +136,7 @@ namespace Codely.UnityAgentClientUI
             EditorApplication.quitting += HandleQuit;
 
             TryRestoreFromDomainReload();
+            try { userHidden = SessionState.GetBool(SessionKey_UserHidden, false); } catch { userHidden = false; }
             StartIfNeeded();
         }
 
@@ -96,6 +148,32 @@ namespace Codely.UnityAgentClientUI
 
             // In IPC mode we keep behavior simple: close kills processes.
             StopAll(forceKill: true);
+        }
+
+        void OnFocus()
+        {
+            pendingAutoHide = false;
+            pendingAutoHideAt = 0;
+            lastFocusedAt = EditorApplication.timeSinceStartup;
+
+            // Auto-show only if the user didn't explicitly hide it.
+            if (!userHidden)
+            {
+                RequestShow();
+            }
+        }
+
+        void OnLostFocus()
+        {
+            // Don't hide immediately here because the user might be clicking into the tauri-ui window,
+            // and the OS foreground pid can lag by a frame. We schedule a hide and let Tick confirm.
+            pendingAutoHide = true;
+            pendingAutoHideAt = EditorApplication.timeSinceStartup;
+
+            // Drop focus smoothing so we react promptly when switching to other Unity windows/tabs.
+            lastFocusedAt = -99999;
+
+            Repaint();
         }
 
         void HandleQuit()
@@ -110,11 +188,195 @@ namespace Codely.UnityAgentClientUI
                 if (IsProcessAlive(serveProcess)) SessionState.SetInt(SessionKey_ServerPid, serveProcess.Id);
                 if (IsProcessAlive(uiProcess)) SessionState.SetInt(SessionKey_UiPid, uiProcess.Id);
                 if (!string.IsNullOrWhiteSpace(ipcPath)) SessionState.SetString(SessionKey_IpcPath, ipcPath);
+                SessionState.SetBool(SessionKey_UserHidden, userHidden);
             }
             catch
             {
                 // ignore
             }
+        }
+
+        static bool IsUnityApplicationActive()
+        {
+            try
+            {
+                if (!s_checkedUnityAppActive)
+                {
+                    s_checkedUnityAppActive = true;
+                    var t = Type.GetType("UnityEditorInternal.InternalEditorUtility, UnityEditor");
+                    s_unityIsAppActiveProp = t?.GetProperty("isApplicationActive", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+                }
+
+                if (s_unityIsAppActiveProp != null && s_unityIsAppActiveProp.PropertyType == typeof(bool))
+                {
+                    return (bool)s_unityIsAppActiveProp.GetValue(null, null);
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+
+            // Fallback: assume active (we still gate by EditorWindow focus).
+            return true;
+        }
+
+        static bool IsRectSanePx(int x, int y, int w, int h)
+        {
+            if (w <= 0 || h <= 0) return false;
+            if (w > 30000 || h > 30000) return false;
+
+#if UNITY_EDITOR_WIN
+            var vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            var vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            var vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            var vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+
+            if (vw <= 0 || vh <= 0) return true;
+
+            const int margin = 512;
+            return (x + w) > (vx - margin) &&
+                   x < (vx + vw + margin) &&
+                   (y + h) > (vy - margin) &&
+                   y < (vy + vh + margin);
+#else
+            return true;
+#endif
+        }
+
+        static bool TryComputeSaneRectPx(Rect rectScreenPoints, out int xPx, out int yPx, out int wPx, out int hPx, out float usedScale)
+        {
+            xPx = yPx = wPx = hPx = 0;
+            usedScale = 1f;
+
+            // GUIToScreenPoint can be "points" or "pixels" depending on platform / DPI / Unity version.
+            // Try both and pick the one that fits the current virtual screen bounds.
+            var ppp = EditorGUIUtility.pixelsPerPoint;
+
+            var xa = Mathf.RoundToInt(rectScreenPoints.xMin * ppp);
+            var ya = Mathf.RoundToInt(rectScreenPoints.yMin * ppp);
+            var wa = Mathf.Max(1, Mathf.RoundToInt(rectScreenPoints.width * ppp));
+            var ha = Mathf.Max(1, Mathf.RoundToInt(rectScreenPoints.height * ppp));
+            var okA = IsRectSanePx(xa, ya, wa, ha);
+
+            var xb = Mathf.RoundToInt(rectScreenPoints.xMin);
+            var yb = Mathf.RoundToInt(rectScreenPoints.yMin);
+            var wb = Mathf.Max(1, Mathf.RoundToInt(rectScreenPoints.width));
+            var hb = Mathf.Max(1, Mathf.RoundToInt(rectScreenPoints.height));
+            var okB = IsRectSanePx(xb, yb, wb, hb);
+
+            if (okA && !okB)
+            {
+                usedScale = ppp;
+                xPx = xa; yPx = ya; wPx = wa; hPx = ha;
+                return true;
+            }
+
+            if (okB && !okA)
+            {
+                usedScale = 1f;
+                xPx = xb; yPx = yb; wPx = wb; hPx = hb;
+                return true;
+            }
+
+            if (okA && okB)
+            {
+                usedScale = ppp;
+                xPx = xa; yPx = ya; wPx = wa; hPx = ha;
+                return true;
+            }
+
+            return false;
+        }
+
+        static bool TryGetFallbackRectPx(out int xPx, out int yPx, out int wPx, out int hPx)
+        {
+            xPx = yPx = wPx = hPx = 0;
+#if UNITY_EDITOR_WIN
+            try
+            {
+                var vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                var vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                var vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                var vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                if (vw <= 0 || vh <= 0) return false;
+
+                wPx = Mathf.Min(1200, vw);
+                hPx = Mathf.Min(800, vh);
+                xPx = vx + (vw - wPx) / 2;
+                yPx = vy + (vh - hPx) / 2;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+#else
+            return false;
+#endif
+        }
+
+        void RequestShow()
+        {
+            userHidden = false;
+            var now = EditorApplication.timeSinceStartup;
+            // "Show" must be a reliable rescue even under heavy editor stalls.
+            // Keep it long enough that the next few EditorApplication.update ticks can publish visible=1 + a sane rect.
+            forceShowUntil = now + 10.0;
+            lastFocusedAt = now;
+            lastUnityAppActiveAt = now;
+            try { SessionState.SetBool(SessionKey_UserHidden, userHidden); } catch { }
+            if (debugLogs)
+            {
+                UnityEngine.Debug.Log($"[IPC Sync] RequestShow: now={now:0.000} forceShowFor={forceShowUntil - now:0.000}s ipc={ipcPath}");
+            }
+
+            // Clear potentially-poisoned rect cache (e.g. bogus huge negative coords during move/resize).
+            hasLastGoodRect = false;
+            wroteRectOnce = false;
+
+            try
+            {
+                EnsureSyncIpc();
+
+                long ownerHwnd = 0;
+#if UNITY_EDITOR_WIN
+                if (Win32WindowEmbedding.TryGetEditorWindowHwnd(this, out var owner, out _))
+                {
+                    ownerHwnd = owner.ToInt64();
+                    if (ownerHwnd != 0) lastOwnerHwnd = ownerHwnd;
+                }
+#endif
+                if (ownerHwnd == 0) ownerHwnd = lastOwnerHwnd;
+
+                var rectOk = embedRectScreenPoints.width > 1f && embedRectScreenPoints.height > 1f;
+
+                if (rectOk && TryComputeSaneRectPx(embedRectScreenPoints, out var xPx, out var yPx, out var wPx, out var hPx, out _))
+                {
+                    syncIpc?.WriteRect(xPx, yPx, wPx, hPx, visible: true, active: true, ownerHwnd: ownerHwnd);
+                }
+                else
+                {
+                    // Last-resort: recenter to virtual screen so the user can recover even if the current rect is missing/garbage.
+                    if (TryGetFallbackRectPx(out var fx, out var fy, out var fw, out var fh))
+                    {
+                        hasLastGoodRect = true;
+                        lastGoodX = fx; lastGoodY = fy; lastGoodW = fw; lastGoodH = fh;
+                        syncIpc?.WriteRect(fx, fy, fw, fh, visible: true, active: true, ownerHwnd: ownerHwnd);
+                    }
+                    else
+                    {
+                        syncIpc?.WriteFlags(visible: true, active: true);
+                    }
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+
+            StartIfNeeded();
+            Focus();
         }
 
         void TryRestoreFromDomainReload()
@@ -163,6 +425,20 @@ namespace Codely.UnityAgentClientUI
                     StopAll(forceKill: true);
                 }
 
+                if (GUILayout.Button(userHidden ? "Show" : "Hide", EditorStyles.toolbarButton, GUILayout.Width(50)))
+                {
+                    if (userHidden)
+                    {
+                        RequestShow();
+                    }
+                    else
+                    {
+                        userHidden = true;
+                        try { SessionState.SetBool(SessionKey_UserHidden, userHidden); } catch { }
+                        try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
+                    }
+                }
+
                 if (GUILayout.Button("Open Browser", EditorStyles.toolbarButton, GUILayout.Width(90)))
                 {
                     Application.OpenURL(DefaultUrl);
@@ -197,6 +473,24 @@ namespace Codely.UnityAgentClientUI
             {
                 GUI.Box(embedRect, "IPC Sync: waiting for first rect publish...");
             }
+
+            // Rescue button: when Tauri gets buried after move/resize, this becomes clickable (because Tauri is no longer on top)
+            // and will force the window to show + raise again.
+            // When Tauri is correctly on top, it will cover this button.
+            {
+                var w = 220f;
+                var h = 40f;
+                var r = new Rect(
+                    embedRect.x + (embedRect.width - w) * 0.5f,
+                    embedRect.y + (embedRect.height - h) * 0.5f,
+                    w,
+                    h);
+
+                if (GUI.Button(r, "Show Agent Window"))
+                {
+                    RequestShow();
+                }
+            }
         }
 
         void Tick()
@@ -212,78 +506,245 @@ namespace Codely.UnityAgentClientUI
                 // Ensure IPC exists early so we always launch Tauri with a valid IPC_PATH/NAME.
                 EnsureSyncIpc();
 
+                // If we lost focus to another Unity tab/window, hide immediately (unless the user clicked into tauri-ui).
+#if UNITY_EDITOR_WIN
+                if (pendingAutoHide)
+                {
+                    var now0 = EditorApplication.timeSinceStartup;
+                    var fgPid0 = GetForegroundPid();
+                    var unityPid0 = Process.GetCurrentProcess().Id;
+                    var tauriPid0 = IsProcessAlive(uiProcess) ? uiProcess.Id : 0;
+                    var tauriForeground0 = tauriPid0 != 0 && fgPid0 == tauriPid0;
+
+                    // Cancel auto-hide if the user is actually interacting with tauri-ui.
+                    if (tauriForeground0)
+                    {
+                        pendingAutoHide = false;
+                    }
+                    else if ((now0 - pendingAutoHideAt) >= 0.016) // ~1 frame grace
+                    {
+                        pendingAutoHide = false;
+                        try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
+                        wroteRectOnce = false;
+                        lastDesiredVisible = false;
+                        lastDesiredActive = false;
+
+                        if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
+                        {
+                            nextDebugLogAt = EditorApplication.timeSinceStartup + 0.5;
+                            UnityEngine.Debug.Log($"[IPC Sync] auto-hide (lost focus): unityPid={unityPid0} fgPid={fgPid0} tauriPid={tauriPid0} ipc={ipcPath}");
+                        }
+
+                        return;
+                    }
+                }
+#else
+                if (pendingAutoHide)
+                {
+                    pendingAutoHide = false;
+                    try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
+                    wroteRectOnce = false;
+                    lastDesiredVisible = false;
+                    lastDesiredActive = false;
+                    return;
+                }
+#endif
+
                 // Keep server alive (only start if port isn't already served).
                 if (!IsProcessAlive(serveProcess) && !IsPortOpen("127.0.0.1", DefaultPort, 50))
                 {
                     StartServer();
                 }
 
-                // Launch Tauri if not running.
-                if (!IsProcessAlive(uiProcess))
+                // Launch Tauri if not running (unless user explicitly hid it).
+                if (!userHidden && !IsProcessAlive(uiProcess))
                 {
                     StartTauri();
                 }
 
-                // Most aggressive policy (per user request): never hide during focus/resize transitions.
-                // We only hide when the window is explicitly stopped/closed.
                 var rectOk = embedRectScreenPoints.width > 1f && embedRectScreenPoints.height > 1f;
 
-                // Determine owner HWND so the Tauri window stays above this EditorWindow (no SetParent).
-                // Note: we do NOT hide when the Tauri window itself takes focus; focus is allowed.
+                // Visibility / layering policy (per user request):
+                // - When Unity (or tauri-ui) is the active foreground app => tauri window may be visible.
+                // - When THIS EditorWindow is focused (or during "Show" rescue window) => tauri window must be on top.
+                // - When Unity is not foreground (other app active) => tauri must hide (no global always-on-top).
+                var now = EditorApplication.timeSinceStartup;
+
+                var unityFocusedRaw = EditorWindow.focusedWindow == this || hasFocus;
+                if (unityFocusedRaw) lastFocusedAt = now;
+                // Focus can jitter during dock/move/resize; smooth it slightly.
+                var unityFocused = unityFocusedRaw || (now - lastFocusedAt) < 0.2;
+
+                var unityAppActive = IsUnityApplicationActive();
+                var fgPid = 0;
+                var unityPid = Process.GetCurrentProcess().Id;
+                var tauriPid = IsProcessAlive(uiProcess) ? uiProcess.Id : 0;
+                var tauriForeground = false;
+#if UNITY_EDITOR_WIN
+                fgPid = GetForegroundPid();
+                tauriForeground = tauriPid != 0 && fgPid == tauriPid;
+#endif
+
+                var unityForeground = fgPid != 0 && fgPid == unityPid;
+                var unityActive = unityAppActive || unityForeground;
+
+                // Requested behavior:
+                // - When switching to other Unity windows/tabs, hide.
+                // - When this agent window is focused, show.
+                // - If the user clicks into tauri-ui, keep it visible so it can be interacted with.
+                // - If Unity isn't active and tauri-ui isn't foreground, hide (never cover other apps).
+                var visibleWanted = !userHidden && (tauriForeground || (unityActive && unityFocused));
+                var activeWanted = visibleWanted; // when visible, keep it topmost (tauri will translate active=>HWND_TOPMOST)
+
+                lastDesiredVisible = visibleWanted;
+                lastDesiredActive = activeWanted;
+
+                // Determine owner HWND so the Tauri window stays above this EditorWindow whenever it's visible.
+                // We intentionally avoid aggressive Z-order manipulation on the Tauri side; ownership is the stable solution.
                 long ownerHwnd = 0;
 #if UNITY_EDITOR_WIN
-                if (Win32WindowEmbedding.TryGetEditorWindowHwnd(this, out var owner, out _))
+                if (visibleWanted && Win32WindowEmbedding.TryGetEditorWindowHwnd(this, out var owner, out _))
                 {
                     ownerHwnd = owner.ToInt64();
                 }
 #endif
-                lastOwnerHwnd = ownerHwnd;
-
-                // If rect becomes temporarily invalid (e.g. 1x1 during dock/resize), keep using lastGoodRect.
-                // This avoids flicker + avoids accidentally hiding the Tauri window during resize drags.
-                if (!rectOk && hasLastGoodRect)
+                // Owner HWND can be temporarily unavailable during docking/move/resize.
+                // Never clear it on a transient failure; otherwise the Tauri window can lose its "owned" layering and disappear.
+                if (ownerHwnd != 0)
                 {
-                    syncIpc.WriteRect(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, ownerHwnd: ownerHwnd);
-                    wroteRectOnce = true;
-                    lastError = null;
-
-                    if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
-                    {
-                        nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
-                        UnityEngine.Debug.Log($"[IPC Sync] rect transient; using lastGood rect: seq={syncIpc.LastSeq} rect=({lastGoodX},{lastGoodY},{lastGoodW},{lastGoodH}) owner=0x{ownerHwnd:X} ipc={ipcPath}");
-                    }
-                    return;
+                    lastOwnerHwnd = ownerHwnd;
+                }
+                else
+                {
+                    ownerHwnd = lastOwnerHwnd;
                 }
 
-                if (!rectOk && !hasLastGoodRect)
+                if (!visibleWanted)
                 {
-                    // No valid rect yet; do not hide.
+                    try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
                     wroteRectOnce = false;
                     if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
                     {
                         nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
-                        UnityEngine.Debug.Log($"[IPC Sync] rect not ready yet: rect=({embedRectScreenPoints.xMin:0.##},{embedRectScreenPoints.yMin:0.##},{embedRectScreenPoints.width:0.##},{embedRectScreenPoints.height:0.##}) ppp={EditorGUIUtility.pixelsPerPoint:0.##} ipc={ipcPath} seq={(syncIpc != null ? syncIpc.LastSeq : 0)}");
+                        UnityEngine.Debug.Log($"[IPC Sync] hide: userHidden={userHidden} unityFocused={unityFocusedRaw} unityFocusedSmoothed={unityFocused} unityAppActive={unityAppActive} unityFg={unityForeground} unityActive={unityActive} tauriFg={tauriForeground} fgPid={fgPid} unityPid={unityPid} tauriPid={tauriPid} ipc={ipcPath} seq={(syncIpc != null ? syncIpc.LastSeq : 0)}");
                     }
                     return;
                 }
 
-                var ppp = EditorGUIUtility.pixelsPerPoint;
-                var xPx = Mathf.RoundToInt(embedRectScreenPoints.xMin * ppp);
-                var yPx = Mathf.RoundToInt(embedRectScreenPoints.yMin * ppp);
-                var wPx = Mathf.RoundToInt(embedRectScreenPoints.width * ppp);
-                var hPx = Mathf.RoundToInt(embedRectScreenPoints.height * ppp);
+                // If rect becomes temporarily invalid (e.g. 1x1 during dock/resize), keep using lastGoodRect.
+                if (!rectOk && hasLastGoodRect)
+                {
+                    if (!IsRectSanePx(lastGoodX, lastGoodY, lastGoodW, lastGoodH))
+                    {
+                        hasLastGoodRect = false;
+                    }
+                    else
+                    {
+                        syncIpc.WriteRect(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                        wroteRectOnce = true;
+                        lastError = null;
+
+                        if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
+                        {
+                            nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
+                            UnityEngine.Debug.Log($"[IPC Sync] rect transient; using lastGood rect: seq={syncIpc.LastSeq} rect=({lastGoodX},{lastGoodY},{lastGoodW},{lastGoodH}) visible=1 active={(activeWanted ? 1 : 0)} owner=0x{ownerHwnd:X} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} ipc={ipcPath}");
+                        }
+                        return;
+                    }
+                }
+
+                if (!rectOk && !hasLastGoodRect)
+                {
+                    // We have no valid rect yet. Publish a fallback on-screen rect so Tauri can actually show (no-flash mode requires w/h>0).
+                    if (TryGetFallbackRectPx(out var fx, out var fy, out var fw, out var fh))
+                    {
+                        hasLastGoodRect = true;
+                        lastGoodX = fx; lastGoodY = fy; lastGoodW = fw; lastGoodH = fh;
+                        syncIpc.WriteRect(fx, fy, fw, fh, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                        wroteRectOnce = true;
+                        lastError = null;
+
+                        if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
+                        {
+                            nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
+                            UnityEngine.Debug.Log($"[IPC Sync] rect not ready; fallback recenter: seq={syncIpc.LastSeq} rect=({fx},{fy},{fw},{fh}) visible=1 active={(activeWanted ? 1 : 0)} owner=0x{ownerHwnd:X} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} ipc={ipcPath}");
+                        }
+                        return;
+                    }
+
+                    // No fallback available; keep visible state, but don't move.
+                    try { syncIpc?.WriteFlags(visible: true, active: activeWanted); } catch { }
+                    wroteRectOnce = false;
+                    if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
+                    {
+                        nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
+                        UnityEngine.Debug.Log($"[IPC Sync] rect not ready yet: visible=1 active={(activeWanted ? 1 : 0)} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} rect=({embedRectScreenPoints.xMin:0.##},{embedRectScreenPoints.yMin:0.##},{embedRectScreenPoints.width:0.##},{embedRectScreenPoints.height:0.##}) ppp={EditorGUIUtility.pixelsPerPoint:0.##} ipc={ipcPath} seq={(syncIpc != null ? syncIpc.LastSeq : 0)}");
+                    }
+                    return;
+                }
+
+                if (!TryComputeSaneRectPx(embedRectScreenPoints, out var xPx, out var yPx, out var wPx, out var hPx, out var usedScale))
+                {
+                    // Occasionally during docking/move/resize Unity reports garbage screen coords (still with non-trivial size).
+                    // Never "poison" lastGoodRect with these values — keep using lastGoodRect if we have one.
+                    if (hasLastGoodRect && !IsRectSanePx(lastGoodX, lastGoodY, lastGoodW, lastGoodH))
+                    {
+                        hasLastGoodRect = false;
+                    }
+
+                    if (hasLastGoodRect)
+                    {
+                        syncIpc.WriteRect(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                        wroteRectOnce = true;
+                        lastError = null;
+                        if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
+                        {
+                            nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
+                            UnityEngine.Debug.Log($"[IPC Sync] rect insane; using lastGood rect: seq={syncIpc.LastSeq} rect=({lastGoodX},{lastGoodY},{lastGoodW},{lastGoodH}) visible=1 active={(activeWanted ? 1 : 0)} owner=0x{ownerHwnd:X} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} ipc={ipcPath}");
+                        }
+                        return;
+                    }
+
+                    // No sane rect to publish yet.
+                    // If we don't have ANY known-good rect, publish a fallback on-screen rect so the user can recover.
+                    if (!hasLastGoodRect && TryGetFallbackRectPx(out var fx, out var fy, out var fw, out var fh))
+                    {
+                        hasLastGoodRect = true;
+                        lastGoodX = fx; lastGoodY = fy; lastGoodW = fw; lastGoodH = fh;
+                        syncIpc.WriteRect(fx, fy, fw, fh, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                        wroteRectOnce = true;
+                        lastError = null;
+
+                        if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
+                        {
+                            nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
+                            UnityEngine.Debug.Log($"[IPC Sync] rect insane; fallback recenter: seq={syncIpc.LastSeq} rect=({fx},{fy},{fw},{fh}) visible=1 active={(activeWanted ? 1 : 0)} owner=0x{ownerHwnd:X} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} ipc={ipcPath}");
+                        }
+                        return;
+                    }
+
+                    // Otherwise: keep visible state, but don't move (avoid moving off-screen).
+                    try { syncIpc?.WriteFlags(visible: true, active: activeWanted); } catch { }
+                    wroteRectOnce = false;
+                    if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
+                    {
+                        nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
+                        UnityEngine.Debug.Log($"[IPC Sync] rect insane; skip publish: visible=1 active={(activeWanted ? 1 : 0)} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} rect=({embedRectScreenPoints.xMin:0.##},{embedRectScreenPoints.yMin:0.##},{embedRectScreenPoints.width:0.##},{embedRectScreenPoints.height:0.##}) ppp={EditorGUIUtility.pixelsPerPoint:0.##} usedScale={usedScale:0.##} ipc={ipcPath} seq={(syncIpc != null ? syncIpc.LastSeq : 0)}");
+                    }
+                    return;
+                }
 
                 hasLastGoodRect = true;
                 lastGoodX = xPx; lastGoodY = yPx; lastGoodW = wPx; lastGoodH = hPx;
 
-                syncIpc.WriteRect(xPx, yPx, wPx, hPx, visible: true, ownerHwnd: ownerHwnd);
+                syncIpc.WriteRect(xPx, yPx, wPx, hPx, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
                 wroteRectOnce = true;
                 lastError = null;
 
                 if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
                 {
                     nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
-                    UnityEngine.Debug.Log($"[IPC Sync] write rect: seq={syncIpc.LastSeq} x={xPx} y={yPx} w={wPx} h={hPx} owner=0x{ownerHwnd:X} ipc={ipcPath} pid={(IsProcessAlive(uiProcess) ? uiProcess.Id : 0)}");
+                    UnityEngine.Debug.Log($"[IPC Sync] write rect: seq={syncIpc.LastSeq} x={xPx} y={yPx} w={wPx} h={hPx} visible=1 active={(activeWanted ? 1 : 0)} owner=0x{ownerHwnd:X} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} ipc={ipcPath} pid={(IsProcessAlive(uiProcess) ? uiProcess.Id : 0)}");
                 }
             }
             catch (Exception ex)
@@ -334,7 +795,7 @@ namespace Codely.UnityAgentClientUI
                 StartServer();
             }
 
-            if (!IsProcessAlive(uiProcess))
+            if (!userHidden && !IsProcessAlive(uiProcess))
             {
                 StartTauri();
             }
@@ -403,6 +864,10 @@ namespace Codely.UnityAgentClientUI
                     return;
                 }
 
+                // Ensure we don't end up with multiple tauri-ui instances fighting each other (causes visible flicker).
+                // This can happen after domain reloads or if Unity lost track of the prior PID.
+                TryKillStaleTauriProcesses(tauriExe);
+
                 var psi = new ProcessStartInfo
                 {
                     FileName = tauriExe,
@@ -428,9 +893,37 @@ namespace Codely.UnityAgentClientUI
             }
         }
 
+        static void TryKillStaleTauriProcesses(string tauriExePath)
+        {
+            if (string.IsNullOrWhiteSpace(tauriExePath)) return;
+            try
+            {
+                foreach (var p in Process.GetProcessesByName("tauri-ui"))
+                {
+                    try
+                    {
+                        string path = null;
+                        try { path = p.MainModule?.FileName; } catch { }
+                        if (string.IsNullOrWhiteSpace(path)) continue;
+                        if (!string.Equals(path, tauriExePath, StringComparison.OrdinalIgnoreCase)) continue;
+
+                        KillProcessTree(p.Id);
+                    }
+                    catch
+                    {
+                        // ignore per-process failures
+                    }
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
         void StopAll(bool forceKill)
         {
-            try { syncIpc?.WriteVisible(false); } catch { }
+            try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
             try { syncIpc?.Dispose(); } catch { }
             syncIpc = null;
 
@@ -635,6 +1128,44 @@ namespace Codely.UnityAgentClientUI
             catch (Exception ex)
             {
                 UnityEngine.Debug.LogWarning("[IPC Sync] dump failed: " + ex.Message);
+            }
+        }
+
+        void DumpState()
+        {
+            try
+            {
+                var now = EditorApplication.timeSinceStartup;
+                var unityFocusedRaw = EditorWindow.focusedWindow == this || hasFocus;
+                var unityFocused = unityFocusedRaw || (now - lastFocusedAt) < 0.75;
+                var unityAppActive = IsUnityApplicationActive();
+                var fgPid = 0;
+                var unityPid = Process.GetCurrentProcess().Id;
+                var tauriPid = IsProcessAlive(uiProcess) ? uiProcess.Id : 0;
+                var tauriForeground = false;
+#if UNITY_EDITOR_WIN
+                fgPid = GetForegroundPid();
+                tauriForeground = tauriPid != 0 && fgPid == tauriPid;
+#endif
+                var unityForeground = fgPid != 0 && fgPid == unityPid;
+                var forceShowLeft = forceShowUntil - now;
+
+                var unityActive = unityAppActive || unityForeground;
+                var visibleWanted = !userHidden && (tauriForeground || (unityActive && unityFocused));
+                var activeWanted = visibleWanted;
+
+                UnityEngine.Debug.Log(
+                    $"[IPC Sync] state: now={now:0.000} userHidden={userHidden} " +
+                    $"unityFocusedRaw={unityFocusedRaw} unityFocusedSmoothed={unityFocused} focusedWindow={EditorWindow.focusedWindow?.GetType().Name ?? "null"} " +
+                    $"unityAppActive={unityAppActive} unityFg={unityForeground} tauriFg={tauriForeground} fgPid={fgPid} unityPid={unityPid} tauriPid={tauriPid} " +
+                    $"unityActive={unityActive} visibleWanted={visibleWanted} activeWanted={activeWanted} forceShowLeft={forceShowLeft:0.000}s " +
+                    $"ipc={ipcPath} seq={(syncIpc != null ? syncIpc.LastSeq : 0)}");
+
+                DumpIpcSnapshot();
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning("[IPC Sync] state dump failed: " + ex.Message);
             }
         }
 
