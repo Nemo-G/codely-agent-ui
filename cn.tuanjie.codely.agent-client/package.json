@@ -1,0 +1,16 @@
+{
+    "name": "cn.tuanjie.codely.agent-client",
+    "version": "0.1.0",
+    "displayName": "Tuanjie Agent Client",
+    "description": "Provides integration of any AI agent (Codely CLI, Gemini CLI, Claude Code, Codex CLI, etc.) with the Unity editor using Agent Client Protocol(ACP). Inspired by nuskey's UnityAgentClient package.",
+    "author": {
+        "name": "codely"
+    },
+    "unity": "2022.3",
+    "unityRelease": "0f1",
+    "type": "module",
+    "dependencies": {
+        "com.unity.modules.ui": "1.0.0",
+        "com.unity.nuget.newtonsoft-json": "3.2.1"
+    }
+}
