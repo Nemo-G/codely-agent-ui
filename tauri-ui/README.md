@@ -1,7 +1,11 @@
 # Unity Agent Client UI (Tauri)
 
-This is the Tauri-based UI for the Unity Agent Client. It is intended to be **embedded inside a Unity `EditorWindow`**
-on Windows (so it feels like part of the editor), via Win32 `SetParent`.
+This is the Tauri-based UI for the Unity Agent Client.
+
+It can be launched by the Unity Editor extension in two ways:
+
+- **IPC Sync (recommended)**: Unity publishes its window rect via shared memory; the Tauri app positions itself.
+- **Embed (legacy, Windows-only)**: Unity embeds the external window via Win32 `SetParent`.
 
 ## Requirements
 
@@ -25,25 +29,29 @@ npm install
 npm run tauri build
 ```
 
+Windows helper scripts (use repo-bundled Wix/NSIS):
+
+```powershell
+cd tauri-ui
+pwsh -File .\build-with-tools.ps1
+# or MSI-only:
+pwsh -File .\build-with-cache.ps1
+```
+
 The exe is typically under:
 
 - `tauri-ui/src-tauri/target/release/tauri-ui.exe`
 
-## Embed into Unity EditorWindow (Windows)
+## Use with Unity (bundled binary)
 
 1. Build the exe (see above).
-2. In your Unity project, edit `UserSettings/UnityAgentClientSettings.json` and set:
+2. Copy it to: `cn.tuanjie.codely.unity-agent-client-ui/Editor/Bin/win/tauri-ui.exe`
+   - Or set `UNITY_AGENT_CLIENT_UI_EXE` to the full path of the exe **before launching Unity**.
+3. In Unity, open: `Tools/Unity ACP Client (IPC Sync)`.
 
-```json
-{
-  "UseEmbeddedTauriUi": true,
-  "UiCommand": "F:\\UnityAgentClient\\tauri-ui\\src-tauri\\target\\release\\tauri-ui.exe",
-  "UiArguments": "",
-  "KillUiOnClose": true
-}
-```
+## Legacy embed mode (Windows)
 
-3. In Unity, open: `Tools/Unity ACP Client (Tauri Embedded)`.
+Open: `Tools/Unity ACP Client` (embeds via `SetParent`).
 
 ## Recommended IDE Setup
 

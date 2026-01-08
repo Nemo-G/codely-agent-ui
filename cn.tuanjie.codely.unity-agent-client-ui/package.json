@@ -2,7 +2,7 @@
   "name": "cn.tuanjie.codely.unity-agent-client-ui",
   "version": "0.1.0",
   "displayName": "Unity Agent Client UI (Embedded Web UI)",
-  "description": "Windows-only: embed an external UI window (Tauri/Browser) inside a Unity EditorWindow. Defaults to launching `codely serve web-ui` and showing http://localhost:3999.",
+  "description": "Windows-only: embed an external UI window (Tauri/Browser) inside a Unity EditorWindow. Defaults to launching `codely serve web-ui` and showing http://127.0.0.1:3939.",
   "author": {
     "name": "codely"
   },

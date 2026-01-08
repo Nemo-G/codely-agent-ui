@@ -9,12 +9,13 @@ namespace Codely.UnityAgentClientUI
 {
     /// <summary>
     /// Windows-only: starts `codely serve web-ui` and embeds an external UI window (prefer Tauri exe; fallback to Edge/Chrome app mode)
-    /// pointing to http://localhost:3999 inside a Unity EditorWindow.
+    /// pointing to http://127.0.0.1:3939 inside a Unity EditorWindow.
     /// </summary>
     public sealed class CodelyWebUiHostWindow : EditorWindow
     {
-        const int DefaultPort = 3999;
-        const string DefaultUrl = "http://localhost:3999";
+        // codely serve web-ui defaults to 3939 (unless --port is specified)
+        const int DefaultPort = 3939;
+        const string DefaultUrl = "http://127.0.0.1:3939";
         const float ToolbarHeight = 24f;
         const string TauriExeEnv1 = "UNITY_AGENT_CLIENT_UI_EXE";
         const string TauriExeEnv2 = "CODELY_UNITY_AGENT_CLIENT_UI_EXE";
@@ -421,7 +422,7 @@ namespace Codely.UnityAgentClientUI
                 var startInfo = new ProcessStartInfo
                 {
                     FileName = "cmd.exe",
-                    Arguments = "/c codely serve web-ui",
+                    Arguments = $"/c codely serve web-ui --port {DefaultPort}",
                     WorkingDirectory = wd,
                     UseShellExecute = false,
                     CreateNoWindow = true,

@@ -248,7 +248,8 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let url_str = env::var("UNITY_AGENT_CLIENT_UI_URL").unwrap_or_else(|_| "http://localhost:3999".to_string());
+    // codely serve web-ui defaults to 3939 (unless --port is specified)
+    let url_str = env::var("UNITY_AGENT_CLIENT_UI_URL").unwrap_or_else(|_| "http://127.0.0.1:3939".to_string());
     let url = url_str.parse().unwrap();
     let is_sync = env::var("UNITY_AGENT_CLIENT_UI_IPC_MODE")
         .map(|v| v.to_lowercase() == "sync")
@@ -262,7 +263,9 @@ pub fn run() {
                 .title("Unity Agent Client")
                 .inner_size(800.0, 600.0)
                 .decorations(false)
-                .resizable(true)
+                // In IPC sync mode, Unity owns the size. Disabling native resize hit-testing prevents
+                // the tauri window from "fighting" Unity when the user drags Unity's borders.
+                .resizable(!is_sync)
                 .skip_taskbar(true);
 
             // IPC Sync: start hidden to avoid "flash then move". We'll show once IPC publishes a valid rect.

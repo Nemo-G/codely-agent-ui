@@ -19,8 +19,9 @@ namespace Codely.UnityAgentClientUI
     /// </summary>
     public sealed class CodelyWebUiIpcSyncWindow : EditorWindow
     {
-        const int DefaultPort = 3999;
-        const string DefaultUrl = "http://localhost:3999";
+        // codely serve web-ui defaults to 3939 (unless --port is specified)
+        const int DefaultPort = 3939;
+        const string DefaultUrl = "http://127.0.0.1:3939";
 
         const string TauriExeEnv1 = "UNITY_AGENT_CLIENT_UI_EXE";
         const string TauriExeEnv2 = "CODELY_UNITY_AGENT_CLIENT_UI_EXE";
@@ -47,6 +48,10 @@ namespace Codely.UnityAgentClientUI
         string lastError;
         string statusLine;
         double nextDebugLogAt;
+        double nextServerProbeAt;
+        bool lastServerPortOpen;
+        double nextServerStartAt;
+        double nextUiStartAt;
         bool debugLogs;
         bool hasLastGoodRect;
         int lastGoodX, lastGoodY, lastGoodW, lastGoodH;
@@ -68,6 +73,9 @@ namespace Codely.UnityAgentClientUI
 
         static bool s_checkedUnityAppActive;
         static PropertyInfo s_unityIsAppActiveProp;
+
+        // Native plugin for window position monitoring (works during Unity UI thread blocking)
+        bool nativePluginRunning;
 
 #if UNITY_EDITOR_WIN
         [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -465,8 +473,25 @@ namespace Codely.UnityAgentClientUI
 
             // Reserve the rest of the window for the UI rect we publish.
             var embedRect = GUILayoutUtility.GetRect(GUIContent.none, GUIStyle.none, GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true));
-            var tl = GUIUtility.GUIToScreenPoint(new Vector2(embedRect.xMin, embedRect.yMin));
-            var br = GUIUtility.GUIToScreenPoint(new Vector2(embedRect.xMax, embedRect.yMax));
+            // IMPORTANT:
+            // Leave a small inset so Unity's resize splitters / window edges are always draggable
+            // and never accidentally hit-test on the tauri window edge.
+            var publishRect = embedRect;
+            {
+                const float EdgeInsetPx = 8f;
+                var inset = EdgeInsetPx / Mathf.Max(1e-3f, EditorGUIUtility.pixelsPerPoint);
+                if (publishRect.width > inset * 2 + 16 && publishRect.height > inset * 2 + 16)
+                {
+                    publishRect = Rect.MinMaxRect(
+                        publishRect.xMin + inset,
+                        publishRect.yMin + inset,
+                        publishRect.xMax - inset,
+                        publishRect.yMax - inset);
+                }
+            }
+
+            var tl = GUIUtility.GUIToScreenPoint(new Vector2(publishRect.xMin, publishRect.yMin));
+            var br = GUIUtility.GUIToScreenPoint(new Vector2(publishRect.xMax, publishRect.yMax));
             embedRectScreenPoints = Rect.MinMaxRect(tl.x, tl.y, br.x, br.y);
 
             if (!wroteRectOnce)
@@ -498,7 +523,10 @@ namespace Codely.UnityAgentClientUI
             // Keep OnGUI running so GUIToScreenPoint + embed rect stay fresh (otherwise we never publish).
             Repaint();
 
-            var serverLabel = IsProcessAlive(serveProcess) ? "Running" : (IsPortOpen("127.0.0.1", DefaultPort, 50) ? "External" : "Stopped");
+            var now = EditorApplication.timeSinceStartup;
+            var portOpen = IsWebUiPortOpenCached(now);
+            var serverAlive = IsProcessAlive(serveProcess);
+            var serverLabel = serverAlive ? (portOpen ? "Running" : "Starting") : (portOpen ? "External" : "Stopped");
             var uiLabel = IsProcessAlive(uiProcess) ? "Tauri" : "Stopped";
 
             try
@@ -510,7 +538,6 @@ namespace Codely.UnityAgentClientUI
 #if UNITY_EDITOR_WIN
                 if (pendingAutoHide)
                 {
-                    var now0 = EditorApplication.timeSinceStartup;
                     var fgPid0 = GetForegroundPid();
                     var unityPid0 = Process.GetCurrentProcess().Id;
                     var tauriPid0 = IsProcessAlive(uiProcess) ? uiProcess.Id : 0;
@@ -521,7 +548,7 @@ namespace Codely.UnityAgentClientUI
                     {
                         pendingAutoHide = false;
                     }
-                    else if ((now0 - pendingAutoHideAt) >= 0.016) // ~1 frame grace
+                    else if ((now - pendingAutoHideAt) >= 0.016) // ~1 frame grace
                     {
                         pendingAutoHide = false;
                         try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
@@ -551,14 +578,17 @@ namespace Codely.UnityAgentClientUI
 #endif
 
                 // Keep server alive (only start if port isn't already served).
-                if (!IsProcessAlive(serveProcess) && !IsPortOpen("127.0.0.1", DefaultPort, 50))
+                if (!serverAlive && !portOpen && now >= nextServerStartAt)
                 {
+                    nextServerStartAt = now + 2.0; // avoid spawn spam on failure
                     StartServer();
+                    nextServerProbeAt = 0; // re-probe soon
                 }
 
                 // Launch Tauri if not running (unless user explicitly hid it).
-                if (!userHidden && !IsProcessAlive(uiProcess))
+                if (!userHidden && !IsProcessAlive(uiProcess) && portOpen && now >= nextUiStartAt)
                 {
+                    nextUiStartAt = now + 1.0;
                     StartTauri();
                 }
 
@@ -568,8 +598,6 @@ namespace Codely.UnityAgentClientUI
                 // - When Unity (or tauri-ui) is the active foreground app => tauri window may be visible.
                 // - When THIS EditorWindow is focused (or during "Show" rescue window) => tauri window must be on top.
                 // - When Unity is not foreground (other app active) => tauri must hide (no global always-on-top).
-                var now = EditorApplication.timeSinceStartup;
-
                 var unityFocusedRaw = EditorWindow.focusedWindow == this || hasFocus;
                 if (unityFocusedRaw) lastFocusedAt = now;
                 // Focus can jitter during dock/move/resize; smooth it slightly.
@@ -790,13 +818,21 @@ namespace Codely.UnityAgentClientUI
             // Ensure IPC exists early (so we can pass env vars to Tauri).
             EnsureSyncIpc();
 
-            if (!IsProcessAlive(serveProcess) && !IsPortOpen("127.0.0.1", DefaultPort, 50))
+            var now = EditorApplication.timeSinceStartup;
+            var portOpen = IsPortOpen("127.0.0.1", DefaultPort, 50);
+
+            if (!IsProcessAlive(serveProcess) && !portOpen && now >= nextServerStartAt)
             {
+                nextServerStartAt = now + 2.0;
                 StartServer();
+                nextServerProbeAt = 0;
             }
 
-            if (!userHidden && !IsProcessAlive(uiProcess))
+            // Avoid starting the UI until the server is actually accepting connections.
+            // This prevents the webview from getting stuck on ERR_CONNECTION_REFUSED / blank error pages.
+            if (!userHidden && !IsProcessAlive(uiProcess) && portOpen && now >= nextUiStartAt)
             {
+                nextUiStartAt = now + 1.0;
                 StartTauri();
             }
         }
@@ -809,6 +845,30 @@ namespace Codely.UnityAgentClientUI
                 ipcPath = CodelyWindowSyncSharedMemory.DefaultMappingPath();
             }
             syncIpc = CodelyWindowSyncSharedMemory.OpenOrCreate(ipcPath);
+
+            // Try to start native plugin for window position monitoring
+            // This allows Tauri window to follow Unity window even during drag operations
+#if UNITY_EDITOR_WIN
+            if (!nativePluginRunning)
+            {
+                if (Win32WindowEmbedding.TryGetEditorWindowHwnd(this, out var ownerHwnd, out _) && ownerHwnd != IntPtr.Zero)
+                {
+                    if (CodelyWindowSyncNative.TryStart(ownerHwnd.ToInt64(), ipcPath))
+                    {
+                        nativePluginRunning = true;
+                        if (debugLogs)
+                        {
+                            UnityEngine.Debug.Log($"[IPC Sync] native plugin started: hwnd=0x{ownerHwnd.ToInt64():X} ipc={ipcPath}");
+                        }
+                    }
+                    else if (debugLogs)
+                    {
+                        UnityEngine.Debug.LogWarning($"[IPC Sync] native plugin failed to start (DLL may be missing), falling back to C# polling");
+                    }
+                }
+            }
+#endif
+
             if (debugLogs)
             {
                 UnityEngine.Debug.Log($"[IPC Sync] opened mapping: {ipcPath}");
@@ -825,7 +885,7 @@ namespace Codely.UnityAgentClientUI
                 var psi = new ProcessStartInfo
                 {
                     FileName = "cmd.exe",
-                    Arguments = "/c codely serve web-ui",
+                    Arguments = $"/c codely serve web-ui --port {DefaultPort}",
                     WorkingDirectory = wd,
                     UseShellExecute = false,
                     CreateNoWindow = true,
@@ -927,6 +987,19 @@ namespace Codely.UnityAgentClientUI
             try { syncIpc?.Dispose(); } catch { }
             syncIpc = null;
 
+            // Stop native plugin
+#if UNITY_EDITOR_WIN
+            if (nativePluginRunning)
+            {
+                CodelyWindowSyncNative.TryStop();
+                nativePluginRunning = false;
+                if (debugLogs)
+                {
+                    UnityEngine.Debug.Log($"[IPC Sync] native plugin stopped");
+                }
+            }
+#endif
+
             StopProcess(ref uiProcess, forceKill);
             StopProcess(ref serveProcess, forceKill);
         }
@@ -989,6 +1062,14 @@ namespace Codely.UnityAgentClientUI
             {
                 return false;
             }
+        }
+
+        bool IsWebUiPortOpenCached(double now)
+        {
+            if (now < nextServerProbeAt) return lastServerPortOpen;
+            lastServerPortOpen = IsPortOpen("127.0.0.1", DefaultPort, 50);
+            nextServerProbeAt = now + 0.5; // avoid blocking per-frame
+            return lastServerPortOpen;
         }
 
         static string GuessWorkspaceRoot()
