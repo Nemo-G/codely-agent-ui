@@ -56,6 +56,7 @@ namespace Codely.UnityAgentClientUI
         bool hasLastGoodRect;
         int lastGoodX, lastGoodY, lastGoodW, lastGoodH;
         long lastOwnerHwnd;
+        uint lastDropSeq;
 
         bool userHidden;
         double forceShowUntil;
@@ -70,12 +71,17 @@ namespace Codely.UnityAgentClientUI
         // IMPORTANT: Do not hide if the user clicked into the tauri-ui window itself.
         bool pendingAutoHide;
         double pendingAutoHideAt;
+        string lastDisableNonce;
 
         static bool s_checkedUnityAppActive;
         static PropertyInfo s_unityIsAppActiveProp;
+        static bool s_domainReloading;
+        static double s_domainReloadingAt;
 
         // Native plugin for window position monitoring (works during Unity UI thread blocking)
         bool nativePluginRunning;
+        string lastPublishedDragText;
+        double lastPublishedDragAt;
 
 #if UNITY_EDITOR_WIN
         [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -139,13 +145,30 @@ namespace Codely.UnityAgentClientUI
 
         void OnEnable()
         {
+            // Avoid duplicate subscriptions across domain reload / window recreation.
+            EditorApplication.update -= Tick;
             EditorApplication.update += Tick;
+
+            AssemblyReloadEvents.beforeAssemblyReload -= PersistForDomainReload;
             AssemblyReloadEvents.beforeAssemblyReload += PersistForDomainReload;
+
+            EditorApplication.quitting -= HandleQuit;
             EditorApplication.quitting += HandleQuit;
+
+            // Global drag tracking: we can't rely on this window's OnGUI for drops because the tauri window sits above it.
+            EditorApplication.projectWindowItemOnGUI -= OnProjectWindowItemGUI;
+            EditorApplication.projectWindowItemOnGUI += OnProjectWindowItemGUI;
+            EditorApplication.hierarchyWindowItemOnGUI -= OnHierarchyWindowItemOnGUI;
+            EditorApplication.hierarchyWindowItemOnGUI += OnHierarchyWindowItemOnGUI;
+            SceneView.duringSceneGui -= OnSceneViewGUI;
+            SceneView.duringSceneGui += OnSceneViewGUI;
 
             TryRestoreFromDomainReload();
             try { userHidden = SessionState.GetBool(SessionKey_UserHidden, false); } catch { userHidden = false; }
             StartIfNeeded();
+
+            // If we successfully reloaded scripts and this window is alive again, clear the reload marker.
+            s_domainReloading = false;
         }
 
         void OnDisable()
@@ -154,8 +177,60 @@ namespace Codely.UnityAgentClientUI
             AssemblyReloadEvents.beforeAssemblyReload -= PersistForDomainReload;
             EditorApplication.quitting -= HandleQuit;
 
-            // In IPC mode we keep behavior simple: close kills processes.
-            StopAll(forceKill: true);
+            EditorApplication.projectWindowItemOnGUI -= OnProjectWindowItemGUI;
+            EditorApplication.hierarchyWindowItemOnGUI -= OnHierarchyWindowItemOnGUI;
+            SceneView.duringSceneGui -= OnSceneViewGUI;
+
+            // CRITICAL:
+            // OnDisable is called for domain reloads and various editor layout/window lifecycle events.
+            // Never kill external processes (tauri-ui / server) here, otherwise the webview refreshes and flickers.
+            // Users can explicitly Stop/Restart; we hard-stop on Editor quitting only.
+            try { syncIpc?.Dispose(); } catch { }
+            syncIpc = null;
+
+            // However: if the user really closed the window, we MUST stop the external processes,
+            // otherwise tauri will remain on screen with no owner.
+            //
+            // We can't reliably distinguish "close" vs "layout rebuild" synchronously, so we delay a tick and
+            // check if any instances of this window still exist.
+            var disableNonce = Guid.NewGuid().ToString("N");
+            lastDisableNonce = disableNonce;
+            EditorApplication.delayCall += () =>
+            {
+                try
+                {
+                    if (lastDisableNonce != disableNonce) return;
+                    if (s_domainReloading) return;
+                    if (EditorApplication.isCompiling) return;
+                    if (EditorApplication.isUpdating) return;
+
+                    // If no windows exist, the user closed it: stop processes.
+                    if (Resources.FindObjectsOfTypeAll<CodelyWebUiIpcSyncWindow>().Length == 0)
+                    {
+                        StopAll(forceKill: true);
+                    }
+                }
+                catch
+                {
+                    // ignore
+                }
+            };
+        }
+
+        void OnDestroy()
+        {
+            // When the user closes the EditorWindow tab, Unity will destroy the ScriptableObject.
+            // In this case we DO want to stop external processes to avoid leaving an orphan tauri window.
+            try
+            {
+                if (s_domainReloading) return;
+                if (EditorApplication.isCompiling) return;
+                StopAll(forceKill: true);
+            }
+            catch
+            {
+                // ignore
+            }
         }
 
         void OnFocus()
@@ -191,6 +266,8 @@ namespace Codely.UnityAgentClientUI
 
         void PersistForDomainReload()
         {
+            s_domainReloading = true;
+            s_domainReloadingAt = EditorApplication.timeSinceStartup;
             try
             {
                 if (IsProcessAlive(serveProcess)) SessionState.SetInt(SessionKey_ServerPid, serveProcess.Id);
@@ -498,6 +575,10 @@ namespace Codely.UnityAgentClientUI
             var br = GUIUtility.GUIToScreenPoint(new Vector2(publishRect.xMax, publishRect.yMax));
             embedRectScreenPoints = Rect.MinMaxRect(tl.x, tl.y, br.x, br.y);
 
+            // Drag-and-drop bridge: allow dropping Unity objects into the agent window area.
+            // We translate the drop into a "deeplink" text and forward it to the Tauri UI via IPC.
+            TryHandleUnityDragDrop(publishRect);
+
             if (!wroteRectOnce)
             {
                 GUI.Box(embedRect, "IPC Sync: waiting for first rect publish...");
@@ -518,6 +599,233 @@ namespace Codely.UnityAgentClientUI
                 if (GUI.Button(r, "Show Agent Window"))
                 {
                     RequestShow();
+                }
+            }
+        }
+
+        void TryHandleUnityDragDrop(Rect publishRect)
+        {
+            try
+            {
+                var e = Event.current;
+                if (e == null) return;
+
+                // Only treat drops inside the published rect area (leave toolbar free).
+                if (!publishRect.Contains(e.mousePosition)) return;
+
+                if (e.type != EventType.DragUpdated && e.type != EventType.DragPerform) return;
+
+                // Let the user know dropping is supported.
+                DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+
+                if (e.type == EventType.DragPerform)
+                {
+                    DragAndDrop.AcceptDrag();
+                    if (TryBuildDropDeeplinkText(out var deeplinkText))
+                    {
+                        PublishDropDeeplinkToTauri(deeplinkText);
+                    }
+                }
+
+                e.Use();
+            }
+            catch
+            {
+                // ignore (drag should never break OnGUI)
+            }
+        }
+
+        void OnProjectWindowItemGUI(string guid, Rect rect) => TryCaptureUnityDragForTauri();
+
+        void OnHierarchyWindowItemOnGUI(int instanceId, Rect rect) => TryCaptureUnityDragForTauri();
+
+        void OnSceneViewGUI(SceneView sceneView) => TryCaptureUnityDragForTauri();
+
+        void TryCaptureUnityDragForTauri()
+        {
+            // When dragging from Unity to the Tauri window, Unity is the drag source and the Tauri webview is the drop target.
+            // This means our EditorWindow OnGUI will not receive DragPerform events (the Tauri window is on top).
+            // So we capture Unity's current drag payload while it is still inside Unity and forward it via IPC.
+            try
+            {
+                var e = Event.current;
+                if (e == null) return;
+                if (e.type != EventType.DragUpdated && e.type != EventType.DragPerform) return;
+
+                if (!TryBuildDropDeeplinkText(out var deeplinkText)) return;
+
+                var now = EditorApplication.timeSinceStartup;
+                if (string.Equals(deeplinkText, lastPublishedDragText, StringComparison.Ordinal) && (now - lastPublishedDragAt) < 0.25)
+                {
+                    return;
+                }
+
+                lastPublishedDragText = deeplinkText;
+                lastPublishedDragAt = now;
+                PublishDropDeeplinkToTauri(deeplinkText);
+            }
+            catch
+            {
+                // ignore (must never break editor drag UX)
+            }
+        }
+
+        static bool TryBuildDropDeeplinkText(out string deeplinkText)
+        {
+            deeplinkText = null;
+            try
+            {
+                var sb = new StringBuilder(256);
+                var any = false;
+
+                // Unity object references (assets, scene objects, components, etc.)
+                var objs = DragAndDrop.objectReferences;
+                if (objs != null)
+                {
+                    foreach (var o in objs)
+                    {
+                        if (o == null) continue;
+                        var link = BuildUnityObjectDeeplink(o);
+                        if (string.IsNullOrWhiteSpace(link)) continue;
+                        if (any) sb.Append('\n');
+                        sb.Append(link);
+                        any = true;
+                    }
+                }
+
+                // External file drops (best-effort)
+                var paths = DragAndDrop.paths;
+                if (paths != null)
+                {
+                    foreach (var p in paths)
+                    {
+                        if (string.IsNullOrWhiteSpace(p)) continue;
+                        var link = BuildFilePathDeeplink(p);
+                        if (string.IsNullOrWhiteSpace(link)) continue;
+                        if (any) sb.Append('\n');
+                        sb.Append(link);
+                        any = true;
+                    }
+                }
+
+                if (!any) return false;
+                deeplinkText = sb.ToString();
+                return !string.IsNullOrWhiteSpace(deeplinkText);
+            }
+            catch
+            {
+                deeplinkText = null;
+                return false;
+            }
+        }
+
+        static string BuildUnityObjectDeeplink(UnityEngine.Object obj)
+        {
+            if (obj == null) return null;
+            try
+            {
+                string gid = null;
+                try
+                {
+                    // Stable-ish reference that can represent both assets and scene objects.
+                    gid = GlobalObjectId.GetGlobalObjectIdSlow(obj).ToString();
+                }
+                catch
+                {
+                    gid = null;
+                }
+
+                var name = obj.name ?? string.Empty;
+                var type = obj.GetType().FullName ?? obj.GetType().Name;
+
+                var assetPath = string.Empty;
+                var assetGuid = string.Empty;
+                try
+                {
+                    assetPath = AssetDatabase.GetAssetPath(obj) ?? string.Empty;
+                    if (!string.IsNullOrWhiteSpace(assetPath))
+                    {
+                        assetGuid = AssetDatabase.AssetPathToGUID(assetPath) ?? string.Empty;
+                    }
+                }
+                catch
+                {
+                    assetPath = string.Empty;
+                    assetGuid = string.Empty;
+                }
+
+                // Simple deeplink format (text-only). Web UI decides how to render/resolve.
+                // Example:
+                // unity://object?gid=...&guid=...&path=...&name=...&type=...
+                var sb = new StringBuilder(256);
+                sb.Append("unity://object?");
+                var first = true;
+
+                void Add(string k, string v)
+                {
+                    if (string.IsNullOrWhiteSpace(v)) return;
+                    if (!first) sb.Append('&');
+                    first = false;
+                    sb.Append(k);
+                    sb.Append('=');
+                    sb.Append(Uri.EscapeDataString(v));
+                }
+
+                Add("gid", gid);
+                Add("guid", assetGuid);
+                Add("path", assetPath);
+                Add("name", name);
+                Add("type", type);
+
+                return sb.ToString();
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        static string BuildFilePathDeeplink(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return null;
+            try
+            {
+                // Keep it as a deeplink-like text, not a raw OS path.
+                // Example: unity://file?path=C%3A%5Cfoo%5Cbar.png
+                return "unity://file?path=" + Uri.EscapeDataString(path);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        void PublishDropDeeplinkToTauri(string deeplinkText)
+        {
+            if (string.IsNullOrWhiteSpace(deeplinkText)) return;
+            try
+            {
+                EnsureSyncIpc();
+                if (syncIpc == null || string.IsNullOrWhiteSpace(ipcPath)) return;
+
+                // Sidecar file: easiest cross-process payload channel.
+                // Tauri watches dropSeq and reads this file when it changes.
+                var dropPath = ipcPath + ".drop";
+                File.WriteAllText(dropPath, deeplinkText, Encoding.UTF8);
+
+                lastDropSeq = unchecked(lastDropSeq + 1);
+                syncIpc.WriteDropSeq(lastDropSeq);
+
+                if (debugLogs)
+                {
+                    UnityEngine.Debug.Log($"[IPC Sync] drop: seq={lastDropSeq} file={dropPath} bytes={Encoding.UTF8.GetByteCount(deeplinkText)}");
+                }
+            }
+            catch (Exception ex)
+            {
+                if (debugLogs)
+                {
+                    UnityEngine.Debug.LogWarning($"[IPC Sync] drop publish failed: {ex.Message}");
                 }
             }
         }
@@ -894,9 +1202,17 @@ namespace Codely.UnityAgentClientUI
                     return;
                 }
 
-                // Ensure we don't end up with multiple tauri-ui instances fighting each other (causes visible flicker).
-                // This can happen after domain reloads or if Unity lost track of the prior PID.
-                TryKillStaleTauriProcesses(tauriExe);
+                // Domain reloads can cause Unity to lose the Process handle while the external tauri-ui process is still alive.
+                // Never kill it in that case; prefer attaching to an existing instance to avoid a full restart / web refresh.
+                if (TryAttachExistingTauriProcess(tauriExe, out var existing))
+                {
+                    uiProcess = existing;
+                    if (debugLogs && IsProcessAlive(uiProcess))
+                    {
+                        UnityEngine.Debug.Log($"[IPC Sync] attached existing tauri: exe={tauriExe} pid={uiProcess.Id} ipc={ipcPath}");
+                    }
+                    return;
+                }
 
                 var psi = new ProcessStartInfo
                 {
@@ -921,6 +1237,44 @@ namespace Codely.UnityAgentClientUI
             {
                 lastError = $"Failed to start Tauri: {ex.Message}";
             }
+        }
+
+        static bool TryAttachExistingTauriProcess(string tauriExePath, out Process p)
+        {
+            p = null;
+            if (string.IsNullOrWhiteSpace(tauriExePath)) return false;
+            try
+            {
+                Process first = null;
+                foreach (var proc in Process.GetProcessesByName("tauri-ui"))
+                {
+                    if (proc == null) continue;
+                    if (first == null) first = proc;
+
+                    string path = null;
+                    try { path = proc.MainModule?.FileName; } catch { }
+                    if (!string.IsNullOrWhiteSpace(path) && string.Equals(path, tauriExePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        p = proc;
+                        return !p.HasExited;
+                    }
+                }
+
+                // Best-effort fallback: if we can't resolve MainModule paths (permission) but a tauri-ui exists,
+                // prefer attaching over spawning a duplicate instance (which causes flicker / refresh loops).
+                if (first != null)
+                {
+                    p = first;
+                    return !p.HasExited;
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+
+            p = null;
+            return false;
         }
 
         static void TryKillStaleTauriProcesses(string tauriExePath)

@@ -20,17 +20,21 @@ namespace Codely.UnityAgentClientUI
         // 24 i32 h
         // 28 i32 reserved (toolbar px for future / padding)
         // 32 u32 flags (bit0: visible, bit1: active)
+        // 40 i64 ownerHwnd (Windows-only; used to keep the Tauri window above the Unity EditorWindow)
+        // 48 u32 dropSeq (optional extension; incremented by Unity when writing a new deeplink into the sidecar file)
         const int SizeBytes = 64;
         const uint Magic = 0x31495543; // "CUI1" little-endian
         const uint Version = 1;
         const uint FlagVisible = 1u << 0;
         const uint FlagActive = 1u << 1;
+        const int OffsetDropSeq = 48;
 
         readonly string path;
         readonly FileStream file;
         readonly MemoryMappedFile mmf;
         readonly MemoryMappedViewAccessor accessor;
         uint seq;
+        uint dropSeq;
 
         CodelyWindowSyncSharedMemory(string path, FileStream file, MemoryMappedFile mmf, MemoryMappedViewAccessor accessor)
         {
@@ -81,6 +85,7 @@ namespace Codely.UnityAgentClientUI
                 accessor.Write(28, 0);
                 accessor.Write(32, 0u);
                 accessor.Write(40, 0L);
+                accessor.Write(OffsetDropSeq, 0u);
                 accessor.Flush();
             }
             catch
@@ -91,6 +96,7 @@ namespace Codely.UnityAgentClientUI
 
         public string MappingPath => path;
         public uint LastSeq => seq;
+        public uint LastDropSeq => dropSeq;
 
         public void WriteRect(int x, int y, int w, int h, bool visible, bool active, long ownerHwnd = 0)
         {
@@ -125,6 +131,19 @@ namespace Codely.UnityAgentClientUI
                 accessor.Write(32, flags);
                 seq++;
                 accessor.Write(8, seq);
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        public void WriteDropSeq(uint newDropSeq)
+        {
+            try
+            {
+                dropSeq = newDropSeq;
+                accessor.Write(OffsetDropSeq, newDropSeq);
             }
             catch
             {

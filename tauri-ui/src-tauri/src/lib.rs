@@ -2,12 +2,42 @@ use std::env;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tauri::Manager;
 use tauri::{webview::WebviewWindowBuilder, WebviewUrl};
 
 const IPC_MAGIC: u32 = 0x3149_5543; // "CUI1" little-endian
 const IPC_VERSION: u32 = 1;
 const IPC_SIZE: usize = 64;
+const IPC_OFFSET_DROP_SEQ: usize = 48;
+
+#[derive(Clone)]
+struct UnityDropPayload(Arc<UnityDropPayloadInner>);
+
+struct UnityDropPayloadInner {
+    last_seq: Mutex<u32>,
+    last_text: Mutex<String>,
+}
+
+impl Default for UnityDropPayload {
+    fn default() -> Self {
+        Self(Arc::new(UnityDropPayloadInner {
+            last_seq: Mutex::new(0),
+            last_text: Mutex::new(String::new()),
+        }))
+    }
+}
+
+#[tauri::command]
+fn codely_unity_get_last_drop(payload: tauri::State<UnityDropPayload>) -> String {
+    payload
+        .0
+        .last_text
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_default()
+}
 
 fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
     let b = [buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]];
@@ -59,7 +89,7 @@ fn ipc_log(msg: &str) {
     }
 }
 
-fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
+fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload) {
     let mode = env::var("UNITY_AGENT_CLIENT_UI_IPC_MODE").unwrap_or_default();
     if mode.to_lowercase() != "sync" {
         ipc_log(&format!("[tauri][ipc] disabled: UNITY_AGENT_CLIENT_UI_IPC_MODE='{}'", mode));
@@ -100,6 +130,7 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
 
         let mut last_seq: u32 = 0;
         let mut last_owner: i64 = 0;
+        let mut last_drop_seq: u32 = 0;
         let mut tick: u32 = 0;
         let mut is_shown: bool = false;
         let mut last_active: u32 = 0;
@@ -141,7 +172,36 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow) {
             let h = read_i32_le(buf, 24);
             let flags = read_u32_le(buf, 32);
             let owner = read_i64_le(buf, 40);
+            let drop_seq = read_u32_le(buf, IPC_OFFSET_DROP_SEQ);
             let seq2 = read_u32_le(buf, 8);
+
+            // Optional: Unity drag payload (Unity writes a sidecar text file and bumps drop_seq).
+            // We store it and let the webview request it on actual drop.
+            if drop_seq != 0 && drop_seq != last_drop_seq {
+                last_drop_seq = drop_seq;
+                let drop_path = format!("{}.drop", path);
+                match std::fs::read_to_string(&drop_path) {
+                    Ok(text) => {
+                        let deeplink = text.trim().to_string();
+                        if !deeplink.is_empty() {
+                            if let Ok(mut s) = payload.0.last_text.lock() {
+                                *s = deeplink;
+                            }
+                            if let Ok(mut s) = payload.0.last_seq.lock() {
+                                *s = drop_seq;
+                            }
+                            if tick % 60 == 0 {
+                                ipc_log(&format!("[tauri][ipc] drop seq={} path={}", drop_seq, drop_path));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if tick % 120 == 0 {
+                            ipc_log(&format!("[tauri][ipc] drop read failed: {} (path={})", e, drop_path));
+                        }
+                    }
+                }
+            }
 
             if seq1 != seq2 || seq1 == 0 || seq1 == last_seq {
                 continue;
@@ -257,6 +317,8 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(UnityDropPayload::default())
+        .invoke_handler(tauri::generate_handler![codely_unity_get_last_drop])
         .setup(move |app| {
             // Create a single main window that loads the external web UI.
             let mut b = WebviewWindowBuilder::new(app, "main".to_string(), WebviewUrl::External(url))
@@ -270,12 +332,46 @@ pub fn run() {
 
             // IPC Sync: start hidden to avoid "flash then move". We'll show once IPC publishes a valid rect.
             if is_sync {
+                // Drag-and-drop bridge:
+                // when the user drops onto the webview, request Unity's last known drag payload and emit a custom event.
+                b = b.initialization_script(
+                    r#"
+(() => {
+  if (window.__codelyUnityDropBridgeInstalled) return;
+  window.__codelyUnityDropBridgeInstalled = true;
+
+  const getInvoke = () => {
+    try {
+      if (window.__TAURI__?.core?.invoke) return window.__TAURI__.core.invoke;
+      if (window.__TAURI__?.invoke) return window.__TAURI__.invoke;
+    } catch (_) {}
+    return null;
+  };
+
+  window.addEventListener('dragover', (e) => {
+    try { e.preventDefault(); } catch (_) {}
+  }, true);
+
+  window.addEventListener('drop', async (e) => {
+    try {
+      e.preventDefault();
+      const invoke = getInvoke();
+      if (!invoke) return;
+      const text = await invoke('codely_unity_get_last_drop');
+      if (typeof text !== 'string' || !text) return;
+      window.dispatchEvent(new CustomEvent('codely-unity-drop', { detail: { deeplink: text } }));
+    } catch (_) {}
+  }, true);
+})();
+"#,
+                );
                 b = b.visible(false).focused(false);
             }
 
             let w = b.build()?;
 
-            maybe_start_ipc_sync(w.clone());
+            let payload = app.state::<UnityDropPayload>().inner().clone();
+            maybe_start_ipc_sync(w.clone(), payload);
             Ok(())
         })
         .run(tauri::generate_context!())
