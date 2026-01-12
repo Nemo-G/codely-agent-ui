@@ -55,17 +55,21 @@ Tip: during local dev, you can skip copying by setting `UNITY_AGENT_CLIENT_UI_EX
 `CodelyUnityAgentClientUIWindowSync.dll` is an optional native plugin used by **IPC Sync** mode to publish the host rect even while Unity's UI thread is blocked (e.g. docking/dragging).
 If it's missing, IPC Sync will fall back to C# polling (still works, less smooth).
 
-Build it (requires CMake + MSVC):
+Build it (requires CMake + MSVC) **outside** this UPM package folder, then copy only the built DLL into this package.
+
+**Important:** do **NOT** build into `cn.tuanjie.codely.unity-agent-client-ui/Editor/WindowSync/native/` or any subfolder (Unity will scan/import build outputs and may crash by treating `*.obj` as a 3D model).
+
+Example (repo root, out-of-tree build dir):
 
 ```bash
-cd cn.tuanjie.codely.unity-agent-client-ui/Editor/WindowSync/native
-cmake -S . -B build -A x64
-cmake --build build --config Release
+cmake -S cn.tuanjie.codely.unity-agent-client-ui/Editor/WindowSync/native -B .build/WindowSync/win64-release -G "Visual Studio 17 2022" -A x64
+cmake --build .build/WindowSync/win64-release --config Release
 ```
 
-The DLL will be output under `cn.tuanjie.codely.unity-agent-client-ui/Editor/Bin/win/` (often `.../Release/` depending on generator).
+Then copy `CodelyUnityAgentClientUIWindowSync.dll` to:
+- `cn.tuanjie.codely.unity-agent-client-ui/Editor/Bin/win/`
 
-Note: `Editor/WindowSync/native/build/` is generated and should not be committed.
+Note: `.build/` is generated and should not be committed.
 
 Note:
 - **Embed (Legacy)** is Windows-only.

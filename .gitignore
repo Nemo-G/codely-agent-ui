@@ -106,7 +106,13 @@ opencode.json
 /cn.tuanjie.codely.unity-agent-client-ui/Editor/WindowSync/native/build/
 /cn.tuanjie.codely.unity-agent-client-ui/Editor/WindowSync/native/build.meta
 
+# Codely Unity Agent Client UI - out-of-tree build root (do not commit)
+/.build/
+
 # Codely Unity Agent Client UI - MSVC/CMake intermediate outputs (do not commit)
 /cn.tuanjie.codely.unity-agent-client-ui/Editor/Bin/win/**/*.lib
 /cn.tuanjie.codely.unity-agent-client-ui/Editor/Bin/win/**/*.exp
 /cn.tuanjie.codely.unity-agent-client-ui/Editor/Bin/win/**/*.ilk
+
+# Codely CLI local artifacts
+/.codely-cli/
