@@ -4,6 +4,7 @@ using System.IO;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEngine;
 
@@ -509,6 +510,11 @@ namespace Codely.UnityAgentClientUI
                     StartIfNeeded(forceRestart: true);
                 }
 
+                if (GUILayout.Button("Force Restart", EditorStyles.toolbarButton, GUILayout.Width(95)))
+                {
+                    ForceRestartServer();
+                }
+
                 if (GUILayout.Button("Stop", EditorStyles.toolbarButton, GUILayout.Width(50)))
                 {
                     StopAll(forceKill: true);
@@ -531,6 +537,11 @@ namespace Codely.UnityAgentClientUI
                 if (GUILayout.Button("Open Browser", EditorStyles.toolbarButton, GUILayout.Width(90)))
                 {
                     Application.OpenURL(DefaultUrl);
+                }
+
+                if (GUILayout.Button("Log CWD", EditorStyles.toolbarButton, GUILayout.Width(70)))
+                {
+                    UnityEngine.Debug.Log($"[IPC Sync] server cwd={GuessWorkspaceRoot()}");
                 }
 
                 debugLogs = GUILayout.Toggle(debugLogs, "Debug", EditorStyles.toolbarButton, GUILayout.Width(60));
@@ -1169,11 +1180,37 @@ namespace Codely.UnityAgentClientUI
                     CreateNoWindow = true,
                 };
 
+                UnityEngine.Debug.Log($"[IPC Sync] start server: cwd={wd}");
                 serveProcess = Process.Start(psi);
             }
             catch (Exception ex)
             {
                 lastError = $"Failed to start server: {ex.Message}";
+            }
+        }
+
+        void ForceRestartServer()
+        {
+            try
+            {
+                StopAll(forceKill: true);
+
+                var pids = FindListeningPids(DefaultPort);
+                if (pids.Length > 0)
+                {
+                    foreach (var pid in pids)
+                    {
+                        if (pid == Process.GetCurrentProcess().Id) continue;
+                        KillProcessTree(pid);
+                    }
+                    UnityEngine.Debug.Log($"[IPC Sync] force restart: killed port {DefaultPort} listeners: {string.Join(",", pids)}");
+                }
+
+                StartIfNeeded(forceRestart: true);
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning($"[IPC Sync] force restart failed: {ex.Message}");
             }
         }
 
@@ -1498,6 +1535,46 @@ namespace Codely.UnityAgentClientUI
             catch
             {
                 // ignore
+            }
+        }
+
+        static int[] FindListeningPids(int port)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c netstat -ano -p tcp | findstr LISTENING | findstr :{port}",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardOutputEncoding = Encoding.UTF8,
+                    StandardErrorEncoding = Encoding.UTF8,
+                };
+
+                using var p = Process.Start(psi);
+                var output = p?.StandardOutput?.ReadToEnd() ?? "";
+                p?.WaitForExit(800);
+
+                var matches = Regex.Matches(output, @"LISTENING\s+(\d+)\s*$", RegexOptions.Multiline);
+                if (matches.Count == 0) return Array.Empty<int>();
+
+                var list = new System.Collections.Generic.List<int>(matches.Count);
+                foreach (Match m in matches)
+                {
+                    if (m.Groups.Count < 2) continue;
+                    if (int.TryParse(m.Groups[1].Value, out var pid) && pid > 0 && !list.Contains(pid))
+                    {
+                        list.Add(pid);
+                    }
+                }
+                return list.ToArray();
+            }
+            catch
+            {
+                return Array.Empty<int>();
             }
         }
 

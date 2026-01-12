@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEngine;
 
@@ -215,6 +216,11 @@ namespace Codely.UnityAgentClientUI
                     StartIfNeeded(forceRestart: true);
                 }
 
+                if (GUILayout.Button("Force Restart", EditorStyles.toolbarButton, GUILayout.Width(95)))
+                {
+                    ForceRestartServer();
+                }
+
                 if (GUILayout.Button("Stop", EditorStyles.toolbarButton, GUILayout.Width(50)))
                 {
                     ClearPersistedDomainReloadState();
@@ -224,6 +230,11 @@ namespace Codely.UnityAgentClientUI
                 if (GUILayout.Button("Open Browser", EditorStyles.toolbarButton, GUILayout.Width(90)))
                 {
                     Application.OpenURL(DefaultUrl);
+                }
+
+                if (GUILayout.Button("Log CWD", EditorStyles.toolbarButton, GUILayout.Width(70)))
+                {
+                    UnityEngine.Debug.Log($"[Codely WebUI] server cwd={GuessWorkspaceRoot()}");
                 }
 
                 GUILayout.FlexibleSpace();
@@ -428,6 +439,7 @@ namespace Codely.UnityAgentClientUI
                     CreateNoWindow = true,
                 };
 
+                UnityEngine.Debug.Log($"[Codely WebUI] start server: cwd={wd}");
                 serveProcess = Process.Start(startInfo);
                 if (serveProcess == null)
                 {
@@ -437,6 +449,34 @@ namespace Codely.UnityAgentClientUI
             catch (Exception ex)
             {
                 lastError = $"Failed to start server: {ex.Message}";
+            }
+        }
+
+        void ForceRestartServer()
+        {
+            try
+            {
+                ClearPersistedDomainReloadState();
+                StopAll(forceKill: true);
+
+                // If 3939 is already occupied by an external server, Unity's auto-start logic will NOT replace it.
+                // Here we explicitly kill the listener(s) and restart with the Unity project root as cwd.
+                var pids = FindListeningPids(DefaultPort);
+                if (pids.Length > 0)
+                {
+                    foreach (var pid in pids)
+                    {
+                        if (pid == Process.GetCurrentProcess().Id) continue;
+                        KillProcessTree(pid);
+                    }
+                    UnityEngine.Debug.Log($"[Codely WebUI] force restart: killed port {DefaultPort} listeners: {string.Join(",", pids)}");
+                }
+
+                StartIfNeeded(forceRestart: true);
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning($"[Codely WebUI] force restart failed: {ex.Message}");
             }
         }
 
@@ -579,30 +619,10 @@ namespace Codely.UnityAgentClientUI
 
         static string GuessWorkspaceRoot()
         {
-            // Prefer a parent directory that contains CODELY.md or a .git folder.
-            var projectRoot = Directory.GetParent(Application.dataPath)?.FullName ?? ".";
-            var dir = projectRoot;
-
-            for (int i = 0; i < 6; i++)
-            {
-                try
-                {
-                    if (File.Exists(Path.Combine(dir, "CODELY.md")) || Directory.Exists(Path.Combine(dir, ".git")))
-                    {
-                        return dir;
-                    }
-                }
-                catch
-                {
-                    // ignore
-                }
-
-                var parent = Directory.GetParent(dir);
-                if (parent == null) break;
-                dir = parent.FullName;
-            }
-
-            return projectRoot;
+            // IMPORTANT: always treat the currently opened Unity project as the workspace root.
+            // `codely serve web-ui` should resolve relative paths/config from the Unity project root,
+            // not from this package's repo folder (or any parent that happens to contain a .git/CODELY.md).
+            return Directory.GetParent(Application.dataPath)?.FullName ?? ".";
         }
 
         static bool TryFindTauriUiExecutable(out string path, out string error)
@@ -767,6 +787,48 @@ namespace Codely.UnityAgentClientUI
             catch
             {
                 // ignore
+            }
+        }
+
+        static int[] FindListeningPids(int port)
+        {
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c netstat -ano -p tcp | findstr LISTENING | findstr :{port}",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardOutputEncoding = Encoding.UTF8,
+                    StandardErrorEncoding = Encoding.UTF8,
+                };
+
+                using var p = Process.Start(psi);
+                var output = p?.StandardOutput?.ReadToEnd() ?? "";
+                p?.WaitForExit(800);
+
+                // Example line:
+                //   TCP    127.0.0.1:3939         0.0.0.0:0              LISTENING       12345
+                var matches = Regex.Matches(output, @"LISTENING\s+(\d+)\s*$", RegexOptions.Multiline);
+                if (matches.Count == 0) return Array.Empty<int>();
+
+                var list = new System.Collections.Generic.List<int>(matches.Count);
+                foreach (Match m in matches)
+                {
+                    if (m.Groups.Count < 2) continue;
+                    if (int.TryParse(m.Groups[1].Value, out var pid) && pid > 0 && !list.Contains(pid))
+                    {
+                        list.Add(pid);
+                    }
+                }
+                return list.ToArray();
+            }
+            catch
+            {
+                return Array.Empty<int>();
             }
         }
     }
