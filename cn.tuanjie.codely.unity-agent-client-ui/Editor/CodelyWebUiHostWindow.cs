@@ -257,9 +257,7 @@ namespace Codely.UnityAgentClientUI
             {
                 Application.OpenURL(DefaultUrl);
             }
-            return;
-#endif
-
+#else
             // Reserve the rest of the window for the embedded UI.
             var embedRect = GUILayoutUtility.GetRect(
                 GUIContent.none,
@@ -280,12 +278,17 @@ namespace Codely.UnityAgentClientUI
                     "Waiting for web-ui window...";
                 GUI.Box(embedRect, msg);
             }
+#endif
         }
 
         void Tick()
         {
             try
             {
+#if !UNITY_EDITOR_WIN
+                // Embedded host mode is Windows-only; avoid spawning any Windows-specific processes.
+                return;
+#else
                 var isServerReachable = IsPortOpen("127.0.0.1", DefaultPort, timeoutMs: 50);
 
                 // Update status.
@@ -397,6 +400,7 @@ namespace Codely.UnityAgentClientUI
 
                 isEmbedded = true;
                 lastError = null;
+#endif
             }
             catch (Exception ex)
             {
@@ -406,50 +410,50 @@ namespace Codely.UnityAgentClientUI
 
         void StartIfNeeded(bool forceRestart = false)
 
+        {
+
+            if (forceRestart)
+
+            {
+
+                StopAll(forceKill: true);
+
+            }
+
+
+            lastError = null;
+
+            isEmbedded = false;
+
+            uiHwnd = IntPtr.Zero;
+
+            hostHwnd = IntPtr.Zero;
+
+            nextFindWindowAt = 0;
+
+            nextServerCheckAt = 0;
+
+            nextServerStartAt = 0;
+
+            lastX = lastY = lastW = lastH = int.MinValue;
+
+            if (!IsProcessAlive(serveProcess))
+
+            {
+
+                // If something else already serves the port, don't start a competing instance.
+
+                if (!IsPortOpen("127.0.0.1", DefaultPort, timeoutMs: 50))
+
                 {
 
-                    if (forceRestart)
-
-                    {
-
-                        StopAll(forceKill: true);
-
-                    }
-
-
-                    lastError = null;
-
-                    isEmbedded = false;
-
-                    uiHwnd = IntPtr.Zero;
-
-                    hostHwnd = IntPtr.Zero;
-
-                    nextFindWindowAt = 0;
-
-                    nextServerCheckAt = 0;
-
-                    nextServerStartAt = 0;
-
-                    lastX = lastY = lastW = lastH = int.MinValue;
-
-                    if (!IsProcessAlive(serveProcess))
-
-                    {
-
-                        // If something else already serves the port, don't start a competing instance.
-
-                        if (!IsPortOpen("127.0.0.1", DefaultPort, timeoutMs: 50))
-
-                        {
-
-                            StartServer();
-
-                        }
-
-                    }
+                    StartServer();
 
                 }
+
+            }
+
+        }
 
         void StartServer()
         {

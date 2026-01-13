@@ -30,11 +30,15 @@ namespace Codely.UnityAgentClientUI
         const string TauriIpcNameEnv = "UNITY_AGENT_CLIENT_UI_IPC_NAME";
         const string TauriIpcModeEnv = "UNITY_AGENT_CLIENT_UI_IPC_MODE";
         const string TauriIpcDebugEnv = "UNITY_AGENT_CLIENT_UI_IPC_DEBUG";
+        const string ServerCwdEnv = "UNITY_AGENT_CLIENT_UI_SERVER_CWD";
+        const string CodelyExeEnv = "CODELY_EXE";
+        const string CodelyExeEnv2 = "UNITY_AGENT_CLIENT_UI_CODELY_EXE";
 
         const string SessionKey_ServerPid = "Codely.UnityAgentClientUI.IpcSync.ServerPid";
         const string SessionKey_UiPid = "Codely.UnityAgentClientUI.IpcSync.UiPid";
         const string SessionKey_IpcPath = "Codely.UnityAgentClientUI.IpcSync.IpcPath";
         const string SessionKey_UserHidden = "Codely.UnityAgentClientUI.IpcSync.UserHidden";
+        const string SessionKey_Detached = "Codely.UnityAgentClientUI.IpcSync.Detached";
 
         const float ToolbarHeight = 22f;
 
@@ -42,6 +46,13 @@ namespace Codely.UnityAgentClientUI
         Process uiProcess;
         string ipcPath;
         CodelyWindowSyncSharedMemory syncIpc;
+        readonly object serverLogLock = new object();
+        string serverStdoutTail;
+        string serverStderrTail;
+
+        readonly object uiLogLock = new object();
+        string uiStdoutTail;
+        string uiStderrTail;
 
         Rect embedRectScreenPoints;
         double lastOnGuiAt;
@@ -54,12 +65,25 @@ namespace Codely.UnityAgentClientUI
         double nextServerStartAt;
         double nextUiStartAt;
         bool debugLogs;
+        double nextForegroundProbeAt;
+        int lastForegroundPid;
+        int lastTauriPid;
         bool hasLastGoodRect;
         int lastGoodX, lastGoodY, lastGoodW, lastGoodH;
         long lastOwnerHwnd;
         uint lastDropSeq;
 
+        // macOS: IPC sync (rect publish + repaint) can be expensive. Throttle to reduce editor UI overhead.
+        double nextRepaintAt;
+        double nextPublishAt;
+        bool hasLastPublishedRect;
+        int lastPublishedX, lastPublishedY, lastPublishedW, lastPublishedH;
+        bool lastPublishedVisible;
+        bool lastPublishedActive;
+        long lastPublishedOwnerHwnd;
+
         bool userHidden;
+        bool detached;
         double forceShowUntil;
         double lastFocusedAt;
         double lastUnityAppActiveAt;
@@ -107,6 +131,58 @@ namespace Codely.UnityAgentClientUI
             return (int)pid;
         }
 #endif
+
+        int GetForegroundPidCached(double now)
+        {
+            // Foreground pid probing can be somewhat expensive on macOS (osascript),
+            // so keep a short cache and only re-probe periodically.
+            if (now < nextForegroundProbeAt) return lastForegroundPid;
+
+            nextForegroundProbeAt = now + 0.1;
+            var pid = TryGetForegroundPidPlatform();
+            // On macOS this can fail (permissions / osascript errors). In that case,
+            // keep the last known value to avoid aggressive auto-hide behavior.
+            if (pid != 0) lastForegroundPid = pid;
+            return lastForegroundPid;
+        }
+
+        static int TryGetForegroundPidPlatform()
+        {
+#if UNITY_EDITOR_WIN
+            return GetForegroundPid();
+#elif UNITY_EDITOR_OSX
+            // NOTE: Best-effort. We avoid native plugins here; this is only used to prevent
+            // auto-hiding when the user clicks into the Tauri window.
+            //
+            // Returns the frontmost application's PID.
+            // osascript: tell System Events to get unix id of first process whose frontmost is true
+            try
+            {
+                var psi = new ProcessStartInfo
+                {
+                    FileName = "/usr/bin/osascript",
+                    Arguments = "-e \"tell application \\\"System Events\\\" to get unix id of first process whose frontmost is true\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardOutputEncoding = Encoding.UTF8,
+                    StandardErrorEncoding = Encoding.UTF8,
+                };
+                using var p = Process.Start(psi);
+                if (p == null) return 0;
+                if (!p.WaitForExit(250)) return 0;
+                var s = (p.StandardOutput?.ReadToEnd() ?? "").Trim();
+                return int.TryParse(s, out var pid) ? pid : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+#else
+            return 0;
+#endif
+        }
 
         [MenuItem("Tools/Unity ACP Client (IPC Sync)")]
         static void OpenMenu() => OpenWindow();
@@ -275,6 +351,7 @@ namespace Codely.UnityAgentClientUI
                 if (IsProcessAlive(uiProcess)) SessionState.SetInt(SessionKey_UiPid, uiProcess.Id);
                 if (!string.IsNullOrWhiteSpace(ipcPath)) SessionState.SetString(SessionKey_IpcPath, ipcPath);
                 SessionState.SetBool(SessionKey_UserHidden, userHidden);
+                SessionState.SetBool(SessionKey_Detached, detached);
             }
             catch
             {
@@ -398,7 +475,32 @@ namespace Codely.UnityAgentClientUI
                 return false;
             }
 #else
-            return false;
+            try
+            {
+                // Best-effort on macOS/Linux: center a sane default rect on the main display.
+                // This is used only when we have no valid OnGUI rect yet (e.g. first Show click).
+                var d = Display.main;
+                var sw = d != null ? d.systemWidth : 0;
+                var sh = d != null ? d.systemHeight : 0;
+                if (sw <= 0 || sh <= 0)
+                {
+                    // Fallback: use current resolution.
+                    var r = Screen.currentResolution;
+                    sw = r.width;
+                    sh = r.height;
+                }
+                if (sw <= 0 || sh <= 0) return false;
+
+                wPx = Mathf.Min(1200, sw);
+                hPx = Mathf.Min(800, sh);
+                xPx = (sw - wPx) / 2;
+                yPx = (sh - hPx) / 2;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
 #endif
         }
 
@@ -412,6 +514,15 @@ namespace Codely.UnityAgentClientUI
             lastFocusedAt = now;
             lastUnityAppActiveAt = now;
             try { SessionState.SetBool(SessionKey_UserHidden, userHidden); } catch { }
+
+            // If the user clicks Show/Attach while detached, implicitly attach.
+            if (detached)
+            {
+                detached = false;
+                try { SessionState.SetBool(SessionKey_Detached, detached); } catch { }
+                TrySignalAttachToTauri();
+            }
+
             if (debugLogs)
             {
                 UnityEngine.Debug.Log($"[IPC Sync] RequestShow: now={now:0.000} forceShowFor={forceShowUntil - now:0.000}s ipc={ipcPath}");
@@ -476,6 +587,7 @@ namespace Codely.UnityAgentClientUI
                 var serverPid = SessionState.GetInt(SessionKey_ServerPid, 0);
                 var uiPid = SessionState.GetInt(SessionKey_UiPid, 0);
                 var savedIpcPath = SessionState.GetString(SessionKey_IpcPath, null);
+                detached = SessionState.GetBool(SessionKey_Detached, false);
 
                 if (serverPid > 0)
                 {
@@ -531,6 +643,29 @@ namespace Codely.UnityAgentClientUI
                         userHidden = true;
                         try { SessionState.SetBool(SessionKey_UserHidden, userHidden); } catch { }
                         try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
+                    }
+                }
+
+                if (GUILayout.Button(detached ? "Attach" : "Detach", EditorStyles.toolbarButton, GUILayout.Width(60)))
+                {
+                    detached = !detached;
+                    try { SessionState.SetBool(SessionKey_Detached, detached); } catch { }
+
+                    if (detached)
+                    {
+                        TrySignalDetachToTauri();
+
+                        // Stop pushing rect/visibility updates; let the Tauri window become independent.
+                        try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
+                        // Ensure we don't keep repainting heavily.
+                        wroteRectOnce = false;
+                    }
+                    else
+                    {
+                        TrySignalAttachToTauri();
+
+                        // Resume syncing + force show.
+                        RequestShow();
                     }
                 }
 
@@ -607,8 +742,15 @@ namespace Codely.UnityAgentClientUI
                     w,
                     h);
 
-                if (GUI.Button(r, "Show Agent Window"))
+                if (GUI.Button(r, detached ? "Attach" : "Show Agent Window"))
                 {
+                    if (detached)
+                    {
+                        detached = false;
+                        try { SessionState.SetBool(SessionKey_Detached, detached); } catch { }
+                        TrySignalAttachToTauri();
+                    }
+
                     RequestShow();
                 }
             }
@@ -843,10 +985,24 @@ namespace Codely.UnityAgentClientUI
 
         void Tick()
         {
-            // Keep OnGUI running so GUIToScreenPoint + embed rect stay fresh (otherwise we never publish).
-            Repaint();
-
             var now = EditorApplication.timeSinceStartup;
+
+            // Keep OnGUI running so GUIToScreenPoint + embed rect stay fresh (otherwise we never publish).
+            // On macOS, repainting every editor tick is noticeably expensive; throttle it.
+#if UNITY_EDITOR_OSX
+            if (now >= nextRepaintAt)
+            {
+                nextRepaintAt = now + 1.0 / 20.0; // ~20fps is enough for window-follow + input feel
+                Repaint();
+            }
+#else
+            Repaint();
+#endif
+
+            // If the server process died, surface diagnostics (helps on macOS where PATH/cwd issues are common).
+            TryCaptureServerExitIfAny();
+            TryCaptureUiExitIfAny();
+
             var portOpen = IsWebUiPortOpenCached(now);
             var serverAlive = IsProcessAlive(serveProcess);
             var serverLabel = serverAlive ? (portOpen ? "Running" : "Starting") : (portOpen ? "External" : "Stopped");
@@ -857,14 +1013,26 @@ namespace Codely.UnityAgentClientUI
                 // Ensure IPC exists early so we always launch Tauri with a valid IPC_PATH/NAME.
                 EnsureSyncIpc();
 
+                var unityPid0 = Process.GetCurrentProcess().Id;
+                var tauriPid0 = IsProcessAlive(uiProcess) ? uiProcess.Id : 0;
+                if (tauriPid0 != 0) lastTauriPid = tauriPid0;
+                var fgPid0 = GetForegroundPidCached(now);
+                var tauriForeground0 = tauriPid0 != 0 && fgPid0 == tauriPid0;
+                if (!tauriForeground0 && lastTauriPid != 0 && fgPid0 == lastTauriPid)
+                {
+                    tauriForeground0 = true;
+                }
+
                 // If we lost focus to another Unity tab/window, hide immediately (unless the user clicked into tauri-ui).
-#if UNITY_EDITOR_WIN
                 if (pendingAutoHide)
                 {
-                    var fgPid0 = GetForegroundPid();
-                    var unityPid0 = Process.GetCurrentProcess().Id;
-                    var tauriPid0 = IsProcessAlive(uiProcess) ? uiProcess.Id : 0;
-                    var tauriForeground0 = tauriPid0 != 0 && fgPid0 == tauriPid0;
+                    // If we can't reliably determine the foreground process (common on macOS without permissions),
+                    // do NOT auto-hide. This preserves usability even when foreground PID probing is unavailable.
+                    if (fgPid0 == 0)
+                    {
+                        pendingAutoHide = false;
+                        return;
+                    }
 
                     // Cancel auto-hide if the user is actually interacting with tauri-ui.
                     if (tauriForeground0)
@@ -888,17 +1056,7 @@ namespace Codely.UnityAgentClientUI
                         return;
                     }
                 }
-#else
-                if (pendingAutoHide)
-                {
-                    pendingAutoHide = false;
-                    try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
-                    wroteRectOnce = false;
-                    lastDesiredVisible = false;
-                    lastDesiredActive = false;
-                    return;
-                }
-#endif
+                // end auto-hide handling
 
                 // Keep server alive (only start if port isn't already served).
                 if (!serverAlive && !portOpen && now >= nextServerStartAt)
@@ -915,37 +1073,66 @@ namespace Codely.UnityAgentClientUI
                     StartTauri();
                 }
 
+                // Detached mode: keep tauri running, but do not publish rect/visibility updates.
+                // The UI becomes a standalone window.
+                if (detached)
+                {
+                    if (IsProcessAlive(uiProcess))
+                    {
+                        // Best-effort: tell UI to become independent.
+                        TrySignalDetachToTauri();
+                    }
+                    return;
+                }
+
                 var rectOk = embedRectScreenPoints.width > 1f && embedRectScreenPoints.height > 1f;
 
                 // Visibility / layering policy (per user request):
                 // - When Unity (or tauri-ui) is the active foreground app => tauri window may be visible.
                 // - When THIS EditorWindow is focused (or during "Show" rescue window) => tauri window must be on top.
                 // - When Unity is not foreground (other app active) => tauri must hide (no global always-on-top).
-                var unityFocusedRaw = EditorWindow.focusedWindow == this || hasFocus;
+                // Focus can be quirky across platforms when external windows (Tauri) sit on top.
+                // For macOS we rely on focusedWindow only; `hasFocus` can remain true even when dock/tab focus moved.
+                var unityFocusedRaw = EditorWindow.focusedWindow == this;
+#if UNITY_EDITOR_WIN
+                unityFocusedRaw = unityFocusedRaw || hasFocus;
+#endif
                 if (unityFocusedRaw) lastFocusedAt = now;
                 // Focus can jitter during dock/move/resize; smooth it slightly.
                 var unityFocused = unityFocusedRaw || (now - lastFocusedAt) < 0.2;
 
                 var unityAppActive = IsUnityApplicationActive();
-                var fgPid = 0;
-                var unityPid = Process.GetCurrentProcess().Id;
-                var tauriPid = IsProcessAlive(uiProcess) ? uiProcess.Id : 0;
-                var tauriForeground = false;
-#if UNITY_EDITOR_WIN
-                fgPid = GetForegroundPid();
-                tauriForeground = tauriPid != 0 && fgPid == tauriPid;
-#endif
-
+                var fgPid = fgPid0;
+                var unityPid = unityPid0;
+                var tauriPid = tauriPid0;
+                var tauriForeground = tauriForeground0;
                 var unityForeground = fgPid != 0 && fgPid == unityPid;
                 var unityActive = unityAppActive || unityForeground;
+
+#if !UNITY_EDITOR_WIN
+                // On macOS (and some Unity forks), InternalEditorUtility.isApplicationActive can be unreliable,
+                // and foreground PID probing can be flaky (permissions / helper processes).
+                // If THIS window is focused, treat Unity as active so IPC Sync remains usable.
+                if (!unityActive && unityFocused)
+                {
+                    unityActive = true;
+                }
+#endif
 
                 // Requested behavior:
                 // - When switching to other Unity windows/tabs, hide.
                 // - When this agent window is focused, show.
                 // - If the user clicks into tauri-ui, keep it visible so it can be interacted with.
                 // - If Unity isn't active and tauri-ui isn't foreground, hide (never cover other apps).
-                var visibleWanted = !userHidden && (tauriForeground || (unityActive && unityFocused));
-                var activeWanted = visibleWanted; // when visible, keep it topmost (tauri will translate active=>HWND_TOPMOST)
+                //
+                // On macOS, when focus leaves this EditorWindow (focusedWindow changes), we must hide promptly.
+                // We still keep it visible if the user is actively interacting with the Tauri window.
+                // Force-visible window rescue: after RequestShow we keep the window visible even if focus detection
+                // is temporarily wrong (common on macOS when external windows exist).
+                var forceShow = !userHidden && now <= forceShowUntil;
+
+                var visibleWanted = !userHidden && (forceShow || tauriForeground || unityActive);
+                var activeWanted = !userHidden && (forceShow || tauriForeground || (unityActive && unityFocused));
 
                 lastDesiredVisible = visibleWanted;
                 lastDesiredActive = activeWanted;
@@ -972,7 +1159,19 @@ namespace Codely.UnityAgentClientUI
 
                 if (!visibleWanted)
                 {
+#if UNITY_EDITOR_OSX
+                    // Throttle visibility updates too (avoid hammering shared memory every tick).
+                    if (now >= nextPublishAt && (lastPublishedVisible || lastPublishedActive))
+                    {
+                        nextPublishAt = now + 1.0 / 20.0;
+                        try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
+                        lastPublishedVisible = false;
+                        lastPublishedActive = false;
+                        lastPublishedOwnerHwnd = 0;
+                    }
+#else
                     try { syncIpc?.WriteFlags(visible: false, active: false); } catch { }
+#endif
                     wroteRectOnce = false;
                     if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
                     {
@@ -991,7 +1190,17 @@ namespace Codely.UnityAgentClientUI
                     }
                     else
                     {
+#if UNITY_EDITOR_OSX
+                        // Throttle rect publishing on macOS.
+                        if (now >= nextPublishAt && ShouldPublishRectMac(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: activeWanted, ownerHwnd: ownerHwnd))
+                        {
+                            nextPublishAt = now + 1.0 / 20.0;
+                            syncIpc.WriteRect(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                            CacheLastPublishedRectMac(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                        }
+#else
                         syncIpc.WriteRect(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+#endif
                         wroteRectOnce = true;
                         lastError = null;
 
@@ -1006,14 +1215,51 @@ namespace Codely.UnityAgentClientUI
 
                 if (!rectOk && !hasLastGoodRect)
                 {
-                    // Rect isn't ready yet (common during fast tab switches). Do NOT invent a fallback position.
-                    // Keep the last mapping rect (if any) and only update visibility/topmost flags.
-                    try { syncIpc?.WriteFlags(visible: true, active: activeWanted); } catch { }
-                    wroteRectOnce = false;
-                    if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
+                    // If we don't have any sane rect yet, Tauri will stay hidden (it requires w/h > 0).
+                    // Use a fallback rect while we're force-showing or before we've successfully published any rect.
+                    if ((now <= forceShowUntil || !wroteRectOnce) && TryGetFallbackRectPx(out var fx, out var fy, out var fw, out var fh))
                     {
-                        nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
-                        UnityEngine.Debug.Log($"[IPC Sync] rect not ready yet (no fallback): visible=1 active={(activeWanted ? 1 : 0)} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} rect=({embedRectScreenPoints.xMin:0.##},{embedRectScreenPoints.yMin:0.##},{embedRectScreenPoints.width:0.##},{embedRectScreenPoints.height:0.##}) ppp={EditorGUIUtility.pixelsPerPoint:0.##} ipc={ipcPath} seq={(syncIpc != null ? syncIpc.LastSeq : 0)}");
+                        hasLastGoodRect = true;
+                        lastGoodX = fx; lastGoodY = fy; lastGoodW = fw; lastGoodH = fh;
+#if UNITY_EDITOR_OSX
+                        if (now >= nextPublishAt && ShouldPublishRectMac(fx, fy, fw, fh, visible: true, active: activeWanted, ownerHwnd: ownerHwnd))
+                        {
+                            nextPublishAt = now + 1.0 / 20.0;
+                            syncIpc.WriteRect(fx, fy, fw, fh, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                            CacheLastPublishedRectMac(fx, fy, fw, fh, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                        }
+#else
+                        syncIpc.WriteRect(fx, fy, fw, fh, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+#endif
+                        wroteRectOnce = true;
+                        lastError = null;
+                        if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
+                        {
+                            nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
+                            UnityEngine.Debug.Log($"[IPC Sync] rect not ready; using fallback rect: seq={syncIpc.LastSeq} rect=({fx},{fy},{fw},{fh}) visible=1 active={(activeWanted ? 1 : 0)} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} ipc={ipcPath}");
+                        }
+                    }
+                    else
+                    {
+                        // Keep the last mapping rect (if any) and only update visibility/topmost flags.
+#if UNITY_EDITOR_OSX
+                        if (now >= nextPublishAt && (lastPublishedVisible != true || lastPublishedActive != activeWanted))
+                        {
+                            nextPublishAt = now + 1.0 / 20.0;
+                            try { syncIpc?.WriteFlags(visible: true, active: activeWanted); } catch { }
+                            lastPublishedVisible = true;
+                            lastPublishedActive = activeWanted;
+                            lastPublishedOwnerHwnd = ownerHwnd;
+                        }
+#else
+                        try { syncIpc?.WriteFlags(visible: true, active: activeWanted); } catch { }
+#endif
+                        wroteRectOnce = false;
+                        if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
+                        {
+                            nextDebugLogAt = EditorApplication.timeSinceStartup + 1.0;
+                            UnityEngine.Debug.Log($"[IPC Sync] rect not ready yet (no fallback): visible=1 active={(activeWanted ? 1 : 0)} unityAppActive={unityAppActive} unityFg={unityForeground} unityFocused={unityFocused} tauriFg={tauriForeground} fgPid={fgPid} rect=({embedRectScreenPoints.xMin:0.##},{embedRectScreenPoints.yMin:0.##},{embedRectScreenPoints.width:0.##},{embedRectScreenPoints.height:0.##}) ppp={EditorGUIUtility.pixelsPerPoint:0.##} ipc={ipcPath} seq={(syncIpc != null ? syncIpc.LastSeq : 0)}");
+                        }
                     }
                     return;
                 }
@@ -1029,7 +1275,16 @@ namespace Codely.UnityAgentClientUI
 
                     if (hasLastGoodRect)
                     {
+#if UNITY_EDITOR_OSX
+                        if (now >= nextPublishAt && ShouldPublishRectMac(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: activeWanted, ownerHwnd: ownerHwnd))
+                        {
+                            nextPublishAt = now + 1.0 / 20.0;
+                            syncIpc.WriteRect(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                            CacheLastPublishedRectMac(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                        }
+#else
                         syncIpc.WriteRect(lastGoodX, lastGoodY, lastGoodW, lastGoodH, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+#endif
                         wroteRectOnce = true;
                         lastError = null;
                         if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
@@ -1041,7 +1296,18 @@ namespace Codely.UnityAgentClientUI
                     }
 
                     // No sane rect to publish yet; do not invent one. Keep visible state, but don't move.
+#if UNITY_EDITOR_OSX
+                    if (now >= nextPublishAt && (lastPublishedVisible != true || lastPublishedActive != activeWanted))
+                    {
+                        nextPublishAt = now + 1.0 / 20.0;
+                        try { syncIpc?.WriteFlags(visible: true, active: activeWanted); } catch { }
+                        lastPublishedVisible = true;
+                        lastPublishedActive = activeWanted;
+                        lastPublishedOwnerHwnd = ownerHwnd;
+                    }
+#else
                     try { syncIpc?.WriteFlags(visible: true, active: activeWanted); } catch { }
+#endif
                     wroteRectOnce = false;
                     if (debugLogs && EditorApplication.timeSinceStartup >= nextDebugLogAt)
                     {
@@ -1051,10 +1317,26 @@ namespace Codely.UnityAgentClientUI
                     return;
                 }
 
-                hasLastGoodRect = true;
-                lastGoodX = xPx; lastGoodY = yPx; lastGoodW = wPx; lastGoodH = hPx;
+                // Avoid polluting lastGoodRect with stale mid-drag coords when OnGUI isn't updating.
+                // We only commit lastGoodRect when we recently had a GUI pass or we're actively force-showing.
+                var onGuiAge = now - lastOnGuiAt;
+                var commitLastGood = onGuiAge < 0.2 || unityFocusedRaw || now <= forceShowUntil;
+                if (commitLastGood)
+                {
+                    hasLastGoodRect = true;
+                    lastGoodX = xPx; lastGoodY = yPx; lastGoodW = wPx; lastGoodH = hPx;
+                }
 
+#if UNITY_EDITOR_OSX
+                if (now >= nextPublishAt && ShouldPublishRectMac(xPx, yPx, wPx, hPx, visible: true, active: activeWanted, ownerHwnd: ownerHwnd))
+                {
+                    nextPublishAt = now + 1.0 / 20.0;
+                    syncIpc.WriteRect(xPx, yPx, wPx, hPx, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                    CacheLastPublishedRectMac(xPx, yPx, wPx, hPx, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+                }
+#else
                 syncIpc.WriteRect(xPx, yPx, wPx, hPx, visible: true, active: activeWanted, ownerHwnd: ownerHwnd);
+#endif
                 wroteRectOnce = true;
                 lastError = null;
 
@@ -1170,23 +1452,307 @@ namespace Codely.UnityAgentClientUI
             {
                 if (IsProcessAlive(serveProcess)) return;
 
-                var wd = GuessWorkspaceRoot();
+                var wd = Environment.GetEnvironmentVariable(ServerCwdEnv);
+                if (string.IsNullOrWhiteSpace(wd))
+                {
+                    wd = GuessWorkspaceRoot();
+                }
+
+                // Reset log tails for the new attempt so we don't mix runs.
+                lock (serverLogLock)
+                {
+                    serverStdoutTail = null;
+                    serverStderrTail = null;
+                }
                 var psi = new ProcessStartInfo
                 {
-                    FileName = "cmd.exe",
-                    Arguments = $"/c codely serve web-ui --port {DefaultPort}",
                     WorkingDirectory = wd,
                     UseShellExecute = false,
                     CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardOutputEncoding = Encoding.UTF8,
+                    StandardErrorEncoding = Encoding.UTF8,
                 };
+#if UNITY_EDITOR_WIN
+                psi.FileName = "cmd.exe";
+                psi.Arguments = $"/c codely serve web-ui --port {DefaultPort}";
+#else
+                if (!TryFindCodelyExecutable(out var codelyExe, out var err))
+                {
+                    lastError = err ?? "codely executable not found";
+                    return;
+                }
+                psi.FileName = codelyExe;
+                psi.Arguments = $"serve web-ui --port {DefaultPort}";
+
+                // Unity on macOS often launches with a minimal PATH (missing Homebrew).
+                // Ensure child processes can still resolve node/codely deps.
+                try
+                {
+                    var existingPath = psi.EnvironmentVariables["PATH"];
+                    var extraPath = ":/opt/homebrew/bin:/usr/local/bin";
+                    if (string.IsNullOrWhiteSpace(existingPath))
+                    {
+                        psi.EnvironmentVariables["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin" + extraPath;
+                    }
+                    else if (!existingPath.Contains("/opt/homebrew/bin") && !existingPath.Contains("/usr/local/bin"))
+                    {
+                        psi.EnvironmentVariables["PATH"] = existingPath + extraPath;
+                    }
+                }
+                catch
+                {
+                    // ignore
+                }
+#endif
 
                 UnityEngine.Debug.Log($"[IPC Sync] start server: cwd={wd}");
                 serveProcess = Process.Start(psi);
+                if (serveProcess != null)
+                {
+                    try
+                    {
+                        serveProcess.EnableRaisingEvents = true;
+                        serveProcess.OutputDataReceived += (_, e) => AppendServerLog(ref serverStdoutTail, e?.Data);
+                        serveProcess.ErrorDataReceived += (_, e) => AppendServerLog(ref serverStderrTail, e?.Data);
+                        serveProcess.BeginOutputReadLine();
+                        serveProcess.BeginErrorReadLine();
+                    }
+                    catch
+                    {
+                        // ignore
+                    }
+
+                    // If it dies immediately, surface a helpful error.
+                    try
+                    {
+                        if (serveProcess.WaitForExit(250))
+                        {
+                            var outTail = SafeTrimServerLog(serverStdoutTail);
+                            var errTail = SafeTrimServerLog(serverStderrTail);
+                            lastError =
+                                $"Server exited immediately (code={serveProcess.ExitCode}).\n" +
+                                $"cwd={wd}\n" +
+                                $"cmd={psi.FileName} {psi.Arguments}\n" +
+                                (!string.IsNullOrWhiteSpace(errTail) ? $"stderr:\n{errTail}\n" : "") +
+                                (!string.IsNullOrWhiteSpace(outTail) ? $"stdout:\n{outTail}\n" : "");
+                            if (debugLogs)
+                            {
+                                UnityEngine.Debug.LogError("[IPC Sync] " + lastError);
+                            }
+                            try { serveProcess.Dispose(); } catch { }
+                            serveProcess = null;
+                        }
+                    }
+                    catch
+                    {
+                        // ignore
+                    }
+                }
             }
             catch (Exception ex)
             {
                 lastError = $"Failed to start server: {ex.Message}";
             }
+        }
+
+        void TryCaptureServerExitIfAny()
+        {
+            // NOTE: Called every Tick; keep it cheap.
+            var p = serveProcess;
+            if (p == null) return;
+
+            var exited = false;
+            try { exited = p.HasExited; }
+            catch { exited = true; }
+            if (!exited) return;
+
+            try
+            {
+                var code = 0;
+                try { code = p.ExitCode; } catch { }
+
+                var outTail = SafeTrimServerLog(serverStdoutTail);
+                var errTail = SafeTrimServerLog(serverStderrTail);
+
+                // Avoid overwriting a more specific error set by StartServer immediate-exit path.
+                if (string.IsNullOrWhiteSpace(lastError))
+                {
+                    lastError =
+                        $"Server exited (code={code}).\n" +
+                        (!string.IsNullOrWhiteSpace(errTail) ? $"stderr:\n{errTail}\n" : "") +
+                        (!string.IsNullOrWhiteSpace(outTail) ? $"stdout:\n{outTail}\n" : "");
+                    if (debugLogs)
+                    {
+                        UnityEngine.Debug.LogError("[IPC Sync] " + lastError);
+                    }
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+            finally
+            {
+                try { p.Dispose(); } catch { }
+                serveProcess = null;
+            }
+        }
+
+        void TryCaptureUiExitIfAny()
+        {
+            // NOTE: Called every Tick; keep it cheap.
+            var p = uiProcess;
+            if (p == null) return;
+
+            var exited = false;
+            try { exited = p.HasExited; }
+            catch { exited = true; }
+            if (!exited) return;
+
+            try
+            {
+                var code = 0;
+                try { code = p.ExitCode; } catch { }
+
+                var outTail = SafeTrimServerLog(uiStdoutTail);
+                var errTail = SafeTrimServerLog(uiStderrTail);
+
+                if (string.IsNullOrWhiteSpace(lastError))
+                {
+                    lastError =
+                        $"Tauri exited (code={code}).\n" +
+                        (!string.IsNullOrWhiteSpace(errTail) ? $"stderr:\n{errTail}\n" : "") +
+                        (!string.IsNullOrWhiteSpace(outTail) ? $"stdout:\n{outTail}\n" : "");
+                    if (debugLogs)
+                    {
+                        UnityEngine.Debug.LogError("[IPC Sync] " + lastError);
+                    }
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+            finally
+            {
+                try { p.Dispose(); } catch { }
+                uiProcess = null;
+            }
+        }
+
+        void AppendServerLog(ref string dst, string line)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return;
+            lock (serverLogLock)
+            {
+                dst ??= string.Empty;
+                dst += line + "\n";
+                const int MaxChars = 8192;
+                if (dst.Length > MaxChars)
+                {
+                    dst = dst.Substring(dst.Length - MaxChars);
+                }
+            }
+        }
+
+        void AppendUiLog(ref string dst, string line)
+        {
+            if (string.IsNullOrWhiteSpace(line)) return;
+            lock (uiLogLock)
+            {
+                dst ??= string.Empty;
+                dst += line + "\n";
+                const int MaxChars = 8192;
+                if (dst.Length > MaxChars)
+                {
+                    dst = dst.Substring(dst.Length - MaxChars);
+                }
+            }
+        }
+
+        static string SafeTrimServerLog(string s)
+        {
+            try { return string.IsNullOrWhiteSpace(s) ? null : s.Trim(); }
+            catch { return null; }
+        }
+
+        static bool TryFindCodelyExecutable(out string path, out string error)
+        {
+            path = null;
+            error = null;
+
+            try
+            {
+                var env1 = Environment.GetEnvironmentVariable(CodelyExeEnv2);
+                if (!string.IsNullOrWhiteSpace(env1) && File.Exists(env1))
+                {
+                    path = env1;
+                    return true;
+                }
+
+                var env2 = Environment.GetEnvironmentVariable(CodelyExeEnv);
+                if (!string.IsNullOrWhiteSpace(env2) && File.Exists(env2))
+                {
+                    path = env2;
+                    return true;
+                }
+
+#if UNITY_EDITOR_OSX
+                string[] candidates = { "/opt/homebrew/bin/codely", "/usr/local/bin/codely" };
+                foreach (var c in candidates)
+                {
+                    if (File.Exists(c))
+                    {
+                        path = c;
+                        return true;
+                    }
+                }
+#endif
+
+                // Best-effort fallback: `which codely`
+                try
+                {
+                    var psi = new ProcessStartInfo
+                    {
+                        FileName = "/usr/bin/which",
+                        Arguments = "codely",
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        StandardOutputEncoding = Encoding.UTF8,
+                        StandardErrorEncoding = Encoding.UTF8,
+                    };
+                    using var p = Process.Start(psi);
+                    if (p != null && p.WaitForExit(300))
+                    {
+                        var s = (p.StandardOutput?.ReadToEnd() ?? "").Trim();
+                        if (!string.IsNullOrWhiteSpace(s) && File.Exists(s))
+                        {
+                            path = s;
+                            return true;
+                        }
+                    }
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+            catch
+            {
+                // ignore
+            }
+
+            error =
+                "Failed to locate `codely` executable. On macOS, Unity often lacks Homebrew PATH.\n" +
+                "Fix options:\n" +
+                "- Install codely under /opt/homebrew/bin/codely, or\n" +
+                "- Set env UNITY_AGENT_CLIENT_UI_CODELY_EXE=/absolute/path/to/codely, or\n" +
+                "- Set env CODELY_EXE=/absolute/path/to/codely.";
+            return false;
         }
 
         void ForceRestartServer()
@@ -1251,12 +1817,23 @@ namespace Codely.UnityAgentClientUI
                     return;
                 }
 
+                // Reset log tails for the new attempt so we don't mix runs.
+                lock (uiLogLock)
+                {
+                    uiStdoutTail = null;
+                    uiStderrTail = null;
+                }
+
                 var psi = new ProcessStartInfo
                 {
                     FileName = tauriExe,
                     WorkingDirectory = Path.GetDirectoryName(tauriExe) ?? ".",
                     UseShellExecute = false,
                     CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    StandardOutputEncoding = Encoding.UTF8,
+                    StandardErrorEncoding = Encoding.UTF8,
                 };
                 psi.EnvironmentVariables["UNITY_AGENT_CLIENT_UI_URL"] = DefaultUrl;
                 psi.EnvironmentVariables[TauriIpcPathEnv] = ipcPath;
@@ -1265,6 +1842,48 @@ namespace Codely.UnityAgentClientUI
                 psi.EnvironmentVariables[TauriIpcDebugEnv] = debugLogs ? "1" : "0";
 
                 uiProcess = Process.Start(psi);
+                if (uiProcess != null)
+                {
+                    try
+                    {
+                        uiProcess.EnableRaisingEvents = true;
+                        uiProcess.OutputDataReceived += (_, e) => AppendUiLog(ref uiStdoutTail, e?.Data);
+                        uiProcess.ErrorDataReceived += (_, e) => AppendUiLog(ref uiStderrTail, e?.Data);
+                        uiProcess.BeginOutputReadLine();
+                        uiProcess.BeginErrorReadLine();
+                    }
+                    catch
+                    {
+                        // ignore
+                    }
+
+                    // If it dies immediately, surface a helpful error.
+                    try
+                    {
+                        if (uiProcess.WaitForExit(250))
+                        {
+                            var outTail = SafeTrimServerLog(uiStdoutTail);
+                            var errTail = SafeTrimServerLog(uiStderrTail);
+                            lastError =
+                                $"Tauri exited immediately (code={uiProcess.ExitCode}).\n" +
+                                $"exe={tauriExe}\n" +
+                                $"cwd={psi.WorkingDirectory}\n" +
+                                (!string.IsNullOrWhiteSpace(errTail) ? $"stderr:\n{errTail}\n" : "") +
+                                (!string.IsNullOrWhiteSpace(outTail) ? $"stdout:\n{outTail}\n" : "");
+                            if (debugLogs)
+                            {
+                                UnityEngine.Debug.LogError("[IPC Sync] " + lastError);
+                            }
+                            try { uiProcess.Dispose(); } catch { }
+                            uiProcess = null;
+                        }
+                    }
+                    catch
+                    {
+                        // ignore
+                    }
+                }
+
                 if (debugLogs)
                 {
                     UnityEngine.Debug.Log($"[IPC Sync] start tauri: exe={tauriExe} pid={(uiProcess != null ? uiProcess.Id : 0)} ipc={ipcPath}");
@@ -1513,14 +2132,68 @@ namespace Codely.UnityAgentClientUI
             }
         }
 
+#if UNITY_EDITOR_OSX
+        bool ShouldPublishRectMac(int x, int y, int w, int h, bool visible, bool active, long ownerHwnd)
+        {
+            // If we've never published a rect yet, always publish.
+            if (!hasLastPublishedRect) return true;
+
+            // Only publish when something materially changed.
+            if (x != lastPublishedX || y != lastPublishedY || w != lastPublishedW || h != lastPublishedH) return true;
+            if (visible != lastPublishedVisible || active != lastPublishedActive) return true;
+            if (ownerHwnd != lastPublishedOwnerHwnd) return true;
+            return false;
+        }
+
+        void CacheLastPublishedRectMac(int x, int y, int w, int h, bool visible, bool active, long ownerHwnd)
+        {
+            hasLastPublishedRect = true;
+            lastPublishedX = x;
+            lastPublishedY = y;
+            lastPublishedW = w;
+            lastPublishedH = h;
+            lastPublishedVisible = visible;
+            lastPublishedActive = active;
+            lastPublishedOwnerHwnd = ownerHwnd;
+        }
+#endif
+
+        void TrySignalDetachToTauri()
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(ipcPath)) return;
+
+                // Sidecar flag file: simple cross-process signalling without extra IPC.
+                // - when present and contains "1", tauri stops following Unity and shows decorations.
+                // - when absent or contains "0", tauri follows IPC sync.
+                File.WriteAllText(ipcPath + ".detach", "1", Encoding.UTF8);
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        void TrySignalAttachToTauri()
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(ipcPath)) return;
+                File.WriteAllText(ipcPath + ".detach", "0", Encoding.UTF8);
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
         static void KillProcessTree(int pid)
         {
             try
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = "taskkill",
-                    Arguments = $"/PID {pid} /T /F",
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
@@ -1528,6 +2201,18 @@ namespace Codely.UnityAgentClientUI
                     StandardOutputEncoding = Encoding.UTF8,
                     StandardErrorEncoding = Encoding.UTF8,
                 };
+
+#if UNITY_EDITOR_WIN
+                psi.FileName = "taskkill";
+                psi.Arguments = $"/PID {pid} /T /F";
+#else
+                // Best-effort: kill children then parent.
+                // We avoid interactive prompts and ignore failures (process may already be dead).
+                psi.FileName = "/bin/bash";
+                psi.Arguments =
+                    $"-lc \"(pkill -TERM -P {pid} >/dev/null 2>&1 || true); (kill -TERM {pid} >/dev/null 2>&1 || true); " +
+                    $"sleep 0.2; (pkill -KILL -P {pid} >/dev/null 2>&1 || true); (kill -KILL {pid} >/dev/null 2>&1 || true)\"";
+#endif
 
                 using var p = Process.Start(psi);
                 p?.WaitForExit(2000);
@@ -1544,8 +2229,6 @@ namespace Codely.UnityAgentClientUI
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = "cmd.exe",
-                    Arguments = $"/c netstat -ano -p tcp | findstr LISTENING | findstr :{port}",
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     RedirectStandardOutput = true,
@@ -1553,11 +2236,19 @@ namespace Codely.UnityAgentClientUI
                     StandardOutputEncoding = Encoding.UTF8,
                     StandardErrorEncoding = Encoding.UTF8,
                 };
+#if UNITY_EDITOR_WIN
+                psi.FileName = "cmd.exe";
+                psi.Arguments = $"/c netstat -ano -p tcp | findstr LISTENING | findstr :{port}";
+#else
+                psi.FileName = "/bin/bash";
+                psi.Arguments = $"-lc \"lsof -nP -iTCP:{port} -sTCP:LISTEN -t 2>/dev/null\"";
+#endif
 
                 using var p = Process.Start(psi);
                 var output = p?.StandardOutput?.ReadToEnd() ?? "";
                 p?.WaitForExit(800);
 
+#if UNITY_EDITOR_WIN
                 var matches = Regex.Matches(output, @"LISTENING\s+(\d+)\s*$", RegexOptions.Multiline);
                 if (matches.Count == 0) return Array.Empty<int>();
 
@@ -1571,6 +2262,19 @@ namespace Codely.UnityAgentClientUI
                     }
                 }
                 return list.ToArray();
+#else
+                var lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                if (lines.Length == 0) return Array.Empty<int>();
+                var list = new System.Collections.Generic.List<int>(lines.Length);
+                foreach (var line in lines)
+                {
+                    if (int.TryParse(line.Trim(), out var pid) && pid > 0 && !list.Contains(pid))
+                    {
+                        list.Add(pid);
+                    }
+                }
+                return list.ToArray();
+#endif
             }
             catch
             {

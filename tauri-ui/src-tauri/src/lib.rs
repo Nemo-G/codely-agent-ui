@@ -1,7 +1,7 @@
 use std::env;
 use std::fs::OpenOptions;
-use std::path::PathBuf;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::Manager;
@@ -40,12 +40,22 @@ fn codely_unity_get_last_drop(payload: tauri::State<UnityDropPayload>) -> String
 }
 
 fn read_u32_le(buf: &[u8], offset: usize) -> u32 {
-    let b = [buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]];
+    let b = [
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ];
     u32::from_le_bytes(b)
 }
 
 fn read_i32_le(buf: &[u8], offset: usize) -> i32 {
-    let b = [buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]];
+    let b = [
+        buf[offset],
+        buf[offset + 1],
+        buf[offset + 2],
+        buf[offset + 3],
+    ];
     i32::from_le_bytes(b)
 }
 
@@ -84,7 +94,11 @@ fn ipc_log(msg: &str) {
     }
 
     // Best-effort; never crash the UI for logging.
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(ipc_log_path()) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ipc_log_path())
+    {
         let _ = writeln!(f, "{}", msg);
     }
 }
@@ -92,7 +106,10 @@ fn ipc_log(msg: &str) {
 fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload) {
     let mode = env::var("UNITY_AGENT_CLIENT_UI_IPC_MODE").unwrap_or_default();
     if mode.to_lowercase() != "sync" {
-        ipc_log(&format!("[tauri][ipc] disabled: UNITY_AGENT_CLIENT_UI_IPC_MODE='{}'", mode));
+        ipc_log(&format!(
+            "[tauri][ipc] disabled: UNITY_AGENT_CLIENT_UI_IPC_MODE='{}'",
+            mode
+        ));
         return;
     }
 
@@ -128,12 +145,16 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload)
             }
         };
 
+        let detach_path = format!("{}.detach", path);
+
         let mut last_seq: u32 = 0;
+        #[cfg(windows)]
         let mut last_owner: i64 = 0;
         let mut last_drop_seq: u32 = 0;
         let mut tick: u32 = 0;
         let mut is_shown: bool = false;
         let mut last_active: u32 = 0;
+        let mut last_detached: bool = false;
 
         #[cfg(windows)]
         let hwnd: isize = match window.hwnd() {
@@ -147,6 +168,40 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload)
             // 60 fps target
             std::thread::sleep(Duration::from_millis(16));
             tick = tick.wrapping_add(1);
+
+            // Detached mode (signaled by Unity via sidecar file).
+            // - When detached, stop following Unity rect and show a normal window.
+            // - When attached again, restore IPC sync behavior.
+            let detached = match std::fs::read_to_string(&detach_path) {
+                Ok(s) => s.trim() == "1" || s.trim().eq_ignore_ascii_case("true"),
+                Err(_) => false,
+            };
+
+            if detached != last_detached {
+                last_detached = detached;
+                if detached {
+                    ipc_log("[tauri][ipc] detach=1");
+                    let _ = window.set_always_on_top(false);
+                    let _ = window.set_decorations(true);
+                    let _ = window.set_resizable(true);
+                    let _ = window.set_skip_taskbar(false);
+                    let _ = window.show();
+                } else {
+                    ipc_log("[tauri][ipc] detach=0");
+                    let _ = window.set_skip_taskbar(true);
+                    let _ = window.set_resizable(false);
+                    let _ = window.set_decorations(false);
+                    // Keep it hidden until Unity publishes a valid rect again.
+                    is_shown = false;
+                    let _ = window.hide();
+                    // Reset seq so we accept the next publish.
+                    last_seq = 0;
+                }
+            }
+
+            if detached {
+                continue;
+            }
 
             let buf: &[u8] = &mmap[..];
             if buf.len() < IPC_SIZE {
@@ -191,13 +246,19 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload)
                                 *s = drop_seq;
                             }
                             if tick % 60 == 0 {
-                                ipc_log(&format!("[tauri][ipc] drop seq={} path={}", drop_seq, drop_path));
+                                ipc_log(&format!(
+                                    "[tauri][ipc] drop seq={} path={}",
+                                    drop_seq, drop_path
+                                ));
                             }
                         }
                     }
                     Err(e) => {
                         if tick % 120 == 0 {
-                            ipc_log(&format!("[tauri][ipc] drop read failed: {} (path={})", e, drop_path));
+                            ipc_log(&format!(
+                                "[tauri][ipc] drop read failed: {} (path={})",
+                                e, drop_path
+                            ));
                         }
                     }
                 }
@@ -221,8 +282,9 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload)
             {
                 if hwnd != 0 {
                     use windows_sys::Win32::UI::WindowsAndMessaging::{
-                        SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_HWNDPARENT, SWP_NOACTIVATE, SWP_NOZORDER,
-                        SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+                        SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_HWNDPARENT,
+                        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE,
+                        SW_SHOWNOACTIVATE,
                     };
                     const HWND_TOP: isize = 0;
                     const HWND_TOPMOST: isize = -1;
@@ -243,7 +305,11 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload)
                         unsafe {
                             // Position first (still hidden), then show without activating Unity focus.
                             let insert_after = if want_topmost { HWND_TOPMOST } else { HWND_TOP };
-                            let flags = if want_topmost { SWP_NOACTIVATE } else { SWP_NOACTIVATE | SWP_NOZORDER };
+                            let flags = if want_topmost {
+                                SWP_NOACTIVATE
+                            } else {
+                                SWP_NOACTIVATE | SWP_NOZORDER
+                            };
                             SetWindowPos(hwnd, insert_after, x, y, w, h, flags);
                             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                         }
@@ -253,7 +319,15 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload)
                         unsafe {
                             // Ensure we don't remain topmost when hidden.
                             if last_active != 0 {
-                                SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                                SetWindowPos(
+                                    hwnd,
+                                    HWND_NOTOPMOST,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                                );
                             }
                             ShowWindow(hwnd, SW_HIDE);
                         }
@@ -270,9 +344,25 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload)
                                 // When not active, DO NOT fight z-order; only move/size.
                                 // This avoids "always on top" within Unity when other editor windows are focused.
                                 if last_active != 0 {
-                                    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                                    SetWindowPos(
+                                        hwnd,
+                                        HWND_NOTOPMOST,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                                    );
                                 }
-                                SetWindowPos(hwnd, HWND_TOP, x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+                                SetWindowPos(
+                                    hwnd,
+                                    HWND_TOP,
+                                    x,
+                                    y,
+                                    w,
+                                    h,
+                                    SWP_NOACTIVATE | SWP_NOZORDER,
+                                );
                             }
                         }
                         last_active = active;
@@ -290,17 +380,30 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload)
             if want_show && !is_shown {
                 let _ = window.show();
                 is_shown = true;
+                if active != 0 {
+                    let _ = window.set_focus();
+                }
             } else if !want_show && is_shown {
+                let _ = window.set_always_on_top(false);
                 let _ = window.hide();
                 is_shown = false;
             }
 
             if want_show {
-                let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
+                let _ = window
+                    .set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y }));
                 let _ = window.set_size(tauri::Size::Physical(tauri::PhysicalSize {
                     width: w as u32,
                     height: h as u32,
                 }));
+
+                // Honor "active" hint: when Unity requests active, keep the window above Unity.
+                // IMPORTANT: In IPC sync mode, stealing focus can cause Unity to think it lost focus and immediately
+                // hide the window again (the "flash" symptom). So we avoid calling set_focus here.
+                if active != last_active {
+                    last_active = active;
+                    let _ = window.set_always_on_top(active != 0);
+                }
             }
         }
     });
@@ -309,7 +412,8 @@ fn maybe_start_ipc_sync(window: tauri::WebviewWindow, payload: UnityDropPayload)
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // codely serve web-ui defaults to 3939 (unless --port is specified)
-    let url_str = env::var("UNITY_AGENT_CLIENT_UI_URL").unwrap_or_else(|_| "http://127.0.0.1:3939".to_string());
+    let url_str = env::var("UNITY_AGENT_CLIENT_UI_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3939".to_string());
     let url = url_str.parse().unwrap();
     let is_sync = env::var("UNITY_AGENT_CLIENT_UI_IPC_MODE")
         .map(|v| v.to_lowercase() == "sync")
@@ -321,14 +425,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![codely_unity_get_last_drop])
         .setup(move |app| {
             // Create a single main window that loads the external web UI.
-            let mut b = WebviewWindowBuilder::new(app, "main".to_string(), WebviewUrl::External(url))
-                .title("Unity Agent Client")
-                .inner_size(800.0, 600.0)
-                .decorations(false)
-                // In IPC sync mode, Unity owns the size. Disabling native resize hit-testing prevents
-                // the tauri window from "fighting" Unity when the user drags Unity's borders.
-                .resizable(!is_sync)
-                .skip_taskbar(true);
+            let mut b =
+                WebviewWindowBuilder::new(app, "main".to_string(), WebviewUrl::External(url))
+                    .title("Unity Agent Client")
+                    .inner_size(800.0, 600.0)
+                    .decorations(false)
+                    // In IPC sync mode, Unity owns the size. Disabling native resize hit-testing prevents
+                    // the tauri window from "fighting" Unity when the user drags Unity's borders.
+                    .resizable(!is_sync)
+                    .skip_taskbar(true);
 
             // IPC Sync: start hidden to avoid "flash then move". We'll show once IPC publishes a valid rect.
             if is_sync {
