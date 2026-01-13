@@ -36,6 +36,7 @@ namespace Codely.UnityAgentClientUI
         string statusLine;
         double nextFindWindowAt;
         double nextServerCheckAt;
+        double nextServerStartAt;
         bool isEmbedded;
         int lastX, lastY, lastW, lastH;
         string edgeUserDataDir;
@@ -311,7 +312,12 @@ namespace Codely.UnityAgentClientUI
                     // If something else already serves the port, don't start a competing instance.
                     if (!isServerReachable)
                     {
-                        StartServer();
+                        var now = EditorApplication.timeSinceStartup;
+                        if (now >= nextServerStartAt)
+                        {
+                            nextServerStartAt = now + 2.0; // avoid spawn spam on failure
+                            StartServer();
+                        }
                     }
                 }
 
@@ -399,29 +405,51 @@ namespace Codely.UnityAgentClientUI
         }
 
         void StartIfNeeded(bool forceRestart = false)
-        {
-            if (forceRestart)
-            {
-                StopAll(forceKill: true);
-            }
 
-            lastError = null;
-            isEmbedded = false;
-            uiHwnd = IntPtr.Zero;
-            hostHwnd = IntPtr.Zero;
-            nextFindWindowAt = 0;
-            nextServerCheckAt = 0;
-            lastX = lastY = lastW = lastH = int.MinValue;
-
-            if (!IsProcessAlive(serveProcess))
-            {
-                // If something else already serves the port, don't start a competing instance.
-                if (!IsPortOpen("127.0.0.1", DefaultPort, timeoutMs: 50))
                 {
-                    StartServer();
+
+                    if (forceRestart)
+
+                    {
+
+                        StopAll(forceKill: true);
+
+                    }
+
+
+                    lastError = null;
+
+                    isEmbedded = false;
+
+                    uiHwnd = IntPtr.Zero;
+
+                    hostHwnd = IntPtr.Zero;
+
+                    nextFindWindowAt = 0;
+
+                    nextServerCheckAt = 0;
+
+                    nextServerStartAt = 0;
+
+                    lastX = lastY = lastW = lastH = int.MinValue;
+
+                    if (!IsProcessAlive(serveProcess))
+
+                    {
+
+                        // If something else already serves the port, don't start a competing instance.
+
+                        if (!IsPortOpen("127.0.0.1", DefaultPort, timeoutMs: 50))
+
+                        {
+
+                            StartServer();
+
+                        }
+
+                    }
+
                 }
-            }
-        }
 
         void StartServer()
         {
